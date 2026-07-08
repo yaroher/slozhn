@@ -41,10 +41,18 @@ doc:
 # cargo publish waits for crates.io index propagation since 1.66, so a plain
 # sequential loop is enough. Requires CARGO_REGISTRY_TOKEN in the environment.
 
+# Idempotent: re-running after a partial failure (e.g. the crates.io
+# new-crate rate limit) skips versions that are already published.
 publish-crates:
 	@for crate in $(CRATES); do
 	  echo "── publishing $$crate ──"
-	  cargo publish -p "$$crate" --no-verify
+	  out="$$(cargo publish -p "$$crate" --no-verify 2>&1)" && { echo "$$out"; continue; }
+	  if grep -q "already uploaded\|already exists" <<< "$$out"; then
+	    echo "✓ $$crate: this version is already on crates.io — skipping"
+	  else
+	    echo "$$out"
+	    exit 1
+	  fi
 	done
 
 # --- release -----------------------------------------------------------------
