@@ -27,11 +27,16 @@
 //! Router::new().route("/rpc", slozhn::server::grpc_ws(traced));
 //! ```
 
+mod auth;
 mod retry;
 mod trace;
 
 #[cfg(feature = "otel")]
 mod otel;
 
+pub use auth::{
+    bearer, AuthError, AuthFn, AuthLayer, AuthService, AuthTokenLayer, AuthTokenService,
+    Identity,
+};
 pub use retry::{RetryLayer, RetryService};
 pub use trace::{trace_server, ServerTraced, TraceLayer, TraceService};

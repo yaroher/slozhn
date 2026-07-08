@@ -23,6 +23,7 @@ jobs:
           # PRs restore the master cache but never spend time saving
           save-if: ${{ github.ref == 'refs/heads/master' }}
       - run: cargo test --workspace
+      - run: cargo test -p slozhn-middleware --features otel
       - run: cargo clippy --workspace --all-targets -- -D warnings
       # docs reuse the dependency artifacts already in target/
       - run: cargo doc --workspace --no-deps

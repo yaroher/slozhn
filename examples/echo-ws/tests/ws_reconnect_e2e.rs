@@ -145,3 +145,50 @@ async fn middleware_stack_works_end_to_end() {
         .unwrap();
     assert_eq!(resp.into_inner().payload.as_ref(), b"layered");
 }
+
+#[tokio::test]
+async fn retry_layer_recovers_unary_over_network_break() {
+    use slozhn::middleware::RetryLayer;
+
+    // plain (non-session) server — клиент тоже без resume
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, echo_ws::router()).await;
+    });
+    let (front, proxy) = start_proxy(backend, None).await;
+
+    let channel = slozhn::client::builder(format!("ws://{front}/rpc"))
+        .reconnect_config(slozhn_client::reconnect::AutoConfig {
+            initial_backoff: std::time::Duration::from_millis(50),
+            max_backoff: std::time::Duration::from_millis(200),
+        })
+        .build();
+    let stack = tower::ServiceBuilder::new()
+        .layer(RetryLayer {
+            max_attempts: 5,
+            base_backoff: std::time::Duration::from_millis(200),
+            ..Default::default()
+        })
+        .service(channel);
+    let mut client = EchoClient::new(stack);
+
+    client
+        .unary(Request::new(Msg { payload: Bytes::from_static(b"1") }))
+        .await
+        .unwrap();
+
+    // рвём сеть и тут же возвращаем: первый attempt попадает на мёртвое
+    // соединение (UNAVAILABLE), ретрай после реконнекта должен пройти
+    drop(proxy);
+    let (_f2, _p2) = start_proxy(backend, Some(front)).await;
+
+    let resp = tokio::time::timeout(
+        std::time::Duration::from_secs(15),
+        client.unary(Request::new(Msg { payload: Bytes::from_static(b"2") })),
+    )
+    .await
+    .expect("in time")
+    .expect("retry must recover the unary call");
+    assert_eq!(resp.into_inner().payload.as_ref(), b"2");
+}

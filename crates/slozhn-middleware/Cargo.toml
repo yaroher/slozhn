@@ -29,3 +29,4 @@ tracing-opentelemetry = { version = "0.33", optional = true }
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
 tracing-subscriber = "0.3"
+opentelemetry_sdk = "0.32"

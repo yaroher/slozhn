@@ -177,6 +177,31 @@ for traces; the `otel` feature adds W3C `traceparent` propagation.
 buffering bodies up to 256 KiB; streaming requests are never replayed.
 Retried calls may execute twice server-side — enable for idempotent methods.
 
+### Authentication
+
+Modeled on go-grpc-middleware's auth interceptor. Server: an async `AuthFn`
+runs before the service — reject with a gRPC status or inject an identity
+that handlers read from request extensions. Client: a token layer adds
+`authorization` metadata per call. Metadata travels inside protocol frames
+(not WS upgrade headers), so this works from browsers unchanged.
+
+```rust
+// server
+let auth: AuthFn<UserId> = Arc::new(|headers, _uri| Box::pin(async move {
+    match slozhn::middleware::bearer(headers) {
+        Some(token) => verify(token).await.map_err(|_| AuthError::unauthenticated("bad token")),
+        None => Err(AuthError::unauthenticated("token required")),
+    }
+}));
+let secured = AuthLayer::new(auth).layer(routes);
+Router::new().route("/rpc", slozhn::server::grpc_ws(secured));
+// handlers: request.extensions().get::<Identity<UserId>>()
+
+// client (native and wasm)
+let stack = AuthTokenLayer::bearer(|| current_token()).layer(channel);
+let client = EchoClient::new(stack);
+```
+
 ### Logging in the browser
 
 `tracing` has no default output in wasm — route it to the devtools console
