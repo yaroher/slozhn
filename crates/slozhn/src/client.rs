@@ -128,6 +128,6 @@ pub fn default_spawner() -> Spawner {
     }
     #[cfg(target_arch = "wasm32")]
     {
-        Arc::new(|f| wasm_bindgen_futures::spawn_local(f))
+        Arc::new(wasm_bindgen_futures::spawn_local)
     }
 }

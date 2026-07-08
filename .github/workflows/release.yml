@@ -49,20 +49,33 @@ jobs:
   npm:
     needs: create-release
     runs-on: ubuntu-latest
-    # No npm packages yet: this job arms itself automatically once
-    # packages/*/package.json appears (e.g. @slozhn/protoc-gen-slozhn-es).
-    if: ${{ hashFiles('packages/*/package.json') != '' }}
     steps:
       - uses: actions/checkout@v6
+      # No npm packages yet: the steps below arm themselves automatically
+      # once packages/*/package.json appears (e.g. @slozhn/protoc-gen-slozhn-es).
+      # (hashFiles is unavailable in job-level `if` — no workspace there.)
+      - name: Detect npm workspaces
+        id: detect
+        run: |
+          if compgen -G "packages/*/package.json" > /dev/null; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "no npm workspaces — skipping publish"
+          fi
       - uses: actions/setup-node@v6
+        if: steps.detect.outputs.present == 'true'
         with:
           node-version: "22"
           registry-url: "https://registry.npmjs.org"
       - name: Install
+        if: steps.detect.outputs.present == 'true'
         run: npm ci
       - name: Build workspaces
+        if: steps.detect.outputs.present == 'true'
         run: npm run --workspaces build
       - name: Publish workspaces to npm
+        if: steps.detect.outputs.present == 'true'
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: npm publish --workspaces --access public
