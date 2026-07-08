@@ -9,6 +9,8 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # no debuginfo in CI: faster builds, much smaller caches
+  CARGO_PROFILE_DEV_DEBUG: 0
 
 jobs:
   native:
@@ -17,8 +19,13 @@ jobs:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        with:
+          # PRs restore the master cache but never spend time saving
+          save-if: ${{ github.ref == 'refs/heads/master' }}
       - run: cargo test --workspace
       - run: cargo clippy --workspace --all-targets -- -D warnings
+      # docs reuse the dependency artifacts already in target/
+      - run: cargo doc --workspace --no-deps
 
   wasm:
     runs-on: ubuntu-latest
@@ -28,6 +35,8 @@ jobs:
         with:
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/master' }}
       - run: cargo build --target wasm32-unknown-unknown -p slozhn -p echo-wasm -p browser-app-core
       - run: cargo clippy --target wasm32-unknown-unknown -p slozhn -p slozhn-ws -p slozhn-client -p slozhn-session -p echo-wasm -- -D warnings
 
@@ -41,15 +50,9 @@ jobs:
         with:
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/master' }}
       - uses: taiki-e/install-action@v2
         with:
           tool: wasm-pack
       - run: ./examples/echo-wasm/run-browser-tests.sh
-
-  docs:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo doc --workspace --no-deps
