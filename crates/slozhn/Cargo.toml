@@ -18,12 +18,12 @@ middleware = ["dep:slozhn-middleware"]
 otel = ["middleware", "slozhn-middleware/otel"]
 
 [dependencies]
-slozhn-frame = { path = "../slozhn-frame", version = "1.0.2" }
-slozhn-client = { path = "../slozhn-client", version = "1.0.2" }
-slozhn-session = { path = "../slozhn-session", version = "1.0.2" }
-slozhn-ws = { path = "../slozhn-ws", version = "1.0.2" }
-slozhn-server = { path = "../slozhn-server", version = "1.0.2", optional = true }
-slozhn-middleware = { path = "../slozhn-middleware", version = "1.0.2", optional = true }
+slozhn-frame = { path = "../slozhn-frame", version = "1.0.3" }
+slozhn-client = { path = "../slozhn-client", version = "1.0.3" }
+slozhn-session = { path = "../slozhn-session", version = "1.0.3" }
+slozhn-ws = { path = "../slozhn-ws", version = "1.0.3" }
+slozhn-server = { path = "../slozhn-server", version = "1.0.3", optional = true }
+slozhn-middleware = { path = "../slozhn-middleware", version = "1.0.3", optional = true }
 futures.workspace = true
 http = "1"
 
