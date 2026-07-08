@@ -7,7 +7,7 @@ repository.workspace = true
 description = "tonic-compatible gRPC channel over slozhn frame streams"
 
 [dependencies]
-slozhn-frame = { path = "../slozhn-frame", version = "1.0.0" }
+slozhn-frame = { path = "../slozhn-frame", version = "1.0.1" }
 tonic = { version = "0.14", default-features = false, features = ["codegen"] }
 tower = { version = "0.5", default-features = false }
 http = "1"

@@ -7,8 +7,8 @@ repository.workspace = true
 description = "Bridge: slozhn frame streams -> tonic services"
 
 [dependencies]
-slozhn-frame = { path = "../slozhn-frame", version = "1.0.0" }
-slozhn-session = { path = "../slozhn-session", version = "1.0.0" }
+slozhn-frame = { path = "../slozhn-frame", version = "1.0.1" }
+slozhn-session = { path = "../slozhn-session", version = "1.0.1" }
 tonic = { version = "0.14", default-features = false, features = ["codegen", "router"] }
 tower = { version = "0.5", default-features = false }
 http = "1"
