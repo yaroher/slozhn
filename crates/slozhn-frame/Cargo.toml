@@ -1,0 +1,21 @@
+[package]
+name = "slozhn-frame"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Envelope protocol and stream-multiplexing state machine for slozhn"
+
+[dependencies]
+slozhn-proto = { path = "../slozhn-proto", version = "0.1.0" }
+prost.workspace = true
+bytes.workspace = true
+thiserror.workspace = true
+futures.workspace = true
+# macros = only the proc-macro select!/join!, pulls no runtime — wasm-compatible
+tokio = { workspace = true, features = ["sync", "macros"] }
+http = "1"
+http-body = "1"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "macros", "time"] }

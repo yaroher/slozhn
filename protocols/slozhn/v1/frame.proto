@@ -1,0 +1,87 @@
+syntax = "proto3";
+
+package slozhn.v1;
+
+// One Frame = one transport frame (WS binary message / boundary frame).
+message Frame {
+  uint64 stream_id = 1; // 0 = connection-level
+  uint64 seq = 2;       // session layer; ignored in phase 1
+  oneof kind {
+    Open         open          = 3;
+    Headers      headers       = 4;
+    Message      message       = 5;
+    HalfClose    half_close    = 6;
+    Status       status        = 7;
+    Cancel       cancel        = 8;
+    Ping         ping          = 9;
+    Pong         pong          = 10;
+    WindowUpdate window_update = 11;
+    GoAway       go_away       = 12;
+    Hello        hello         = 13;
+    Ack          ack           = 14;
+  }
+}
+
+message MetadataEntry {
+  string key = 1;
+  oneof value {
+    string ascii = 2;
+    bytes  bin   = 3; // keys with the "-bin" suffix
+  }
+}
+
+message Metadata {
+  repeated MetadataEntry entries = 1;
+}
+
+message Open {
+  string   method   = 1; // "/pkg.Service/Method"
+  Metadata metadata = 2;
+}
+
+message Headers {
+  Metadata metadata = 1;
+}
+
+message Message {
+  bytes payload    = 1;
+  bool  compressed = 2; // reserved; phase 1 does not compress
+}
+
+message HalfClose {}
+
+message Status {
+  uint32   code     = 1; // gRPC status code
+  string   message  = 2;
+  Metadata trailers = 3;
+}
+
+message Cancel {}
+
+message Ping { uint64 opaque = 1; }
+message Pong { uint64 opaque = 1; }
+
+message WindowUpdate {
+  uint32 increment = 1; // stream_id comes from Frame; 0 = connection window
+}
+
+message GoAway {
+  uint64 last_stream_id = 1;
+  uint32 code           = 2; // GoAwayCode
+  string message        = 3;
+}
+
+message Hello {
+  uint32 version                   = 1;
+  uint32 initial_stream_window     = 2;
+  uint32 initial_connection_window = 3;
+  // session layer (spec §8):
+  bytes  session_id    = 4;
+  bytes  resume_token  = 5;
+  uint64 last_recv_seq = 6;
+  // Server response: resume rejected (unknown session / token / TTL).
+  // The client must consider the session dead.
+  bool resume_rejected = 7;
+}
+
+message Ack { uint64 last_seq = 1; }

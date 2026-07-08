@@ -1,0 +1,28 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/slozhn",
+    "crates/slozhn-frame",
+    "crates/slozhn-proto",
+    "crates/slozhn-client",
+    "crates/slozhn-server",
+    "crates/slozhn-ws",
+    "crates/slozhn-session",
+    "crates/slozhn-grpc-tests",
+    "examples/echo-ws",
+    "examples/echo-wasm",
+    "examples/browser-app/core",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/yaroher/slozhn"
+
+[workspace.dependencies]
+prost = "0.14"
+bytes = "1"
+thiserror = "2"
+futures = "0.3"
+tokio = { version = "1", default-features = false }

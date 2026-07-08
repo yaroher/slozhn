@@ -1,0 +1,30 @@
+[package]
+name = "slozhn"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "gRPC over WebSocket for native and wasm: full streaming, reconnect, transparent resume"
+readme = "../../README.md"
+keywords = ["grpc", "websocket", "wasm", "tonic", "streaming"]
+categories = ["network-programming", "web-programming", "wasm"]
+
+[features]
+default = ["client"]
+client = []
+server = ["dep:slozhn-server"]
+
+[dependencies]
+slozhn-frame = { path = "../slozhn-frame", version = "0.1.0" }
+slozhn-client = { path = "../slozhn-client", version = "0.1.0" }
+slozhn-session = { path = "../slozhn-session", version = "0.1.0" }
+slozhn-ws = { path = "../slozhn-ws", version = "0.1.0" }
+slozhn-server = { path = "../slozhn-server", version = "0.1.0", optional = true }
+futures.workspace = true
+http = "1"
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+tokio = { workspace = true, features = ["rt"] }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen-futures = "0.4"

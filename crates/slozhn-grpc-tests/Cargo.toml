@@ -1,0 +1,19 @@
+[package]
+name = "slozhn-grpc-tests"
+version = "0.0.0"
+publish = false
+edition.workspace = true
+
+[dependencies]
+slozhn-proto = { path = "../slozhn-proto" }
+
+[dev-dependencies]
+slozhn-frame = { path = "../slozhn-frame" }
+slozhn-client = { path = "../slozhn-client" }
+slozhn-server = { path = "../slozhn-server" }
+tonic = { version = "0.14", default-features = false, features = ["codegen", "router"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
+tokio-stream = "0.1"
+futures.workspace = true
+bytes.workspace = true
+http = "1"

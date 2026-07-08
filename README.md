@@ -1,0 +1,154 @@
+# slozhn
+
+**gRPC over WebSocket for native and wasm**: all four streaming kinds,
+metadata, trailers, statuses, automatic reconnect, and transparent stream
+resume after network breaks. Plain tonic services and tonic clients — no
+tonic fork.
+
+## Why
+
+Browsers cannot speak real gRPC: `fetch` does not expose trailers (where
+`grpc-status` lives) and cannot stream request bodies, which caps every
+browser gRPC stack (grpc-web, tonic-web) at unary + server-streaming.
+WebSocket is the only full-duplex channel available everywhere. slozhn
+carries the entire gRPC stack over it: the same client code runs on native
+(tokio) and in the browser (wasm32).
+
+## Getting started
+
+### Prerequisites
+
+| What | Needed for |
+|---|---|
+| Rust (stable) + cargo | everything |
+| `protoc-gen-prost`, `protoc-gen-tonic` (`cargo install protoc-gen-prost protoc-gen-tonic`) | generating types from your `.proto` |
+| a protoc driver — [easyp](https://github.com/easyp-tech/easyp) (used in this repo) or `buf` / `protoc` | running the generators |
+| `rustup target add wasm32-unknown-unknown` + [`wasm-pack`](https://rustwasm.github.io/wasm-pack/) | browser builds only |
+
+### 1. Define a service and generate code
+
+Standard prost/tonic codegen — slozhn ships no generators of its own.
+With easyp (see `easyp.yaml` in this repo for a working config):
+
+```yaml
+generate:
+  inputs:
+    - directory: protocols
+  plugins:
+    - name: prost
+      out: gen/src
+      opts: { bytes: "." }
+    - name: tonic
+      out: gen/src
+      opts: { no_transport: "true" }   # keep wasm builds possible
+```
+
+```bash
+easyp generate
+```
+
+### 2. Server (axum)
+
+```toml
+slozhn = { version = "0.1", features = ["client", "server"] }
+```
+
+```rust
+let routes = tonic::service::Routes::new(EchoServer::new(MyEcho));
+
+// plain endpoint
+let app = axum::Router::new().route("/rpc", slozhn::server::grpc_ws(routes));
+
+// or with the session layer: streams survive network breaks
+let manager = slozhn::server::SessionManager::new(Default::default());
+let app = axum::Router::new().route("/rpc", slozhn::server::grpc_ws_session(routes, manager));
+
+axum::serve(listener, app).await?;
+```
+
+Your service implementations are ordinary `#[tonic::async_trait]` code and
+get the full tonic stack: interceptors, tower layers, metadata, trailers.
+
+### 3. Client (native and browser — the same code)
+
+```rust
+let channel = slozhn::client::builder("ws://host/rpc")
+    .resume()   // opt-in: requires grpc_ws_session on the server
+    .build();   // lazy: connects on the first call
+
+let mut client = EchoClient::new(channel); // ordinary generated tonic client
+```
+
+The builder assembles the whole stack (WebSocket → frame codec → optional
+session → reconnect) and picks the executor per platform (`tokio::spawn`
+on native, `spawn_local` on wasm). On disconnect, in-flight RPCs end with
+`UNAVAILABLE` (or survive transparently with `.resume()`); new calls wait
+for the reconnect with exponential backoff.
+
+Browser notes: build with `wasm32-unknown-unknown`; the client crate pulls
+no tokio runtime. The browser `WebSocket` API cannot set headers — pass
+auth via query parameters or cookies (`.header(...)` is native-only and
+panics at build time on wasm).
+
+## How it works
+
+```
+tonic client ──► Channel ──► [session] ──► codec ──► WebSocket ──► axum ──► serve ──► tonic Routes
+    stubs       tower svc     seq/ack      Frame       native:       bridge into the full
+   as-is      auto-reconnect  replay      envelope   tungstenite     tonic middleware stack
+                              dedup       (proto)    wasm: web-sys
+```
+
+- **Envelope protocol** (`protocols/slozhn/v1/frame.proto`): gRPC semantics
+  reified as proto frames — `Open/Headers/Message/HalfClose/Status/Cancel` —
+  multiplexed by `stream_id` over one socket, with h2-style credit flow
+  control, `GoAway`, and session frames.
+- **Session layer** (spec §8): seq/ack, a bounded replay buffer, and dedup —
+  streams survive physical disconnects; a rejected resume honestly fails
+  RPCs with `UNAVAILABLE`, and the reconnect wrapper builds a fresh session.
+- Full design document: `docs/superpowers/specs/2026-07-08-slozhn-design.md`.
+
+## Crates
+
+| Crate | What it is |
+|---|---|
+| `slozhn` | Facade: `client::builder`, `server::{grpc_ws, grpc_ws_session}` |
+| `slozhn-frame` | Envelope + stream-multiplexing state machine (portable core) |
+| `slozhn-ws` | WebSocket byte duplex: tungstenite (native) / web-sys (wasm) |
+| `slozhn-client` | tower channel for tonic stubs + reconnect |
+| `slozhn-server` | WS → tonic `Routes` bridge (axum) |
+| `slozhn-session` | Resume layer: seq/ack/replay |
+| `slozhn-proto` | Generated types (easyp, committed) |
+
+## Examples
+
+| | |
+|---|---|
+| `examples/echo-ws` | Native e2e: server+client bins, network tests (reconnect, resume) |
+| `examples/echo-wasm` | Browser test suite (`./run-browser-tests.sh`, headless chrome) |
+| `examples/browser-app` | Live demo: TS UI (Vite) + Rust wasm core; survives server restarts |
+
+## Developing this repo
+
+```bash
+make test          # cargo test + clippy (native)
+make test-wasm     # wasm32 build + clippy
+make test-browser  # browser e2e (wasm-pack, headless chrome)
+make gen           # regen crates/slozhn-proto after .proto edits
+make release       # interactive tag-driven release (crates.io [+ npm])
+```
+
+Releases are tag-driven: `make release` bumps one version across the cargo
+workspace, commits, tags `vX.Y.Z`, and pushes; `.github/workflows/release.yml`
+re-runs CI, creates a GitHub release, and publishes the crates to crates.io
+(secrets: `CARGO_REGISTRY_TOKEN`; `NPM_TOKEN` once npm packages exist).
+
+## Status
+
+The v1 network core is complete. Deferred: a typed proto boundary for wasm
+(WIT replacement, spec §9), Kotlin/Swift bindings, tracing/middleware,
+server→client RPC.
+
+## License
+
+MIT

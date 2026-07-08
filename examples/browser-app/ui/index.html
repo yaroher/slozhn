@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <title>slozhn browser app</title>
+    <style>
+      body { font-family: monospace; max-width: 720px; margin: 2rem auto; }
+      #log { border: 1px solid #888; padding: 0.5rem; height: 300px; overflow-y: auto; white-space: pre-wrap; }
+      input { width: 320px; }
+    </style>
+  </head>
+  <body>
+    <h1>slozhn: gRPC-over-WS from the browser</h1>
+    <p>
+      <input id="url" value="ws://127.0.0.1:50052/rpc" />
+      <button id="connect">connect</button>
+    </p>
+    <p>
+      <input id="text" value="hello from TS" />
+      <button id="unary" disabled>unary</button>
+      <button id="stream" disabled>stream x10</button>
+    </p>
+    <p>Restart the server while it's running — the session layer survives the break.</p>
+    <div id="log"></div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

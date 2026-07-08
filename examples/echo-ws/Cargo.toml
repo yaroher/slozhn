@@ -1,0 +1,16 @@
+[package]
+name = "echo-ws"
+version = "0.0.0"
+publish = false
+edition.workspace = true
+
+[dependencies]
+slozhn = { path = "../../crates/slozhn", features = ["client", "server"] }
+slozhn-proto = { path = "../../crates/slozhn-proto" }
+tonic = { version = "0.14", default-features = false, features = ["codegen", "router"] }
+axum = { version = "0.8", default-features = false, features = ["ws", "http1", "tokio"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "net", "io-util"] }
+tokio-stream = "0.1"
+futures.workspace = true
+bytes.workspace = true
+http = "1"

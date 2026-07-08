@@ -1,0 +1,18 @@
+# Codegen for the whole project (spec §10). Regenerate with `easyp generate`.
+generate:
+  inputs:
+    - directory: protocols
+  plugins:
+    - name: prost
+      out: crates/slozhn-proto/src
+      opts:
+        bytes: "."
+    - name: tonic
+      out: crates/slozhn-proto/src
+      opts:
+        no_transport: "true"
+    - name: prost-crate
+      out: crates/slozhn-proto
+      opts:
+        include_file: src/lib.rs
+        gen_crate: protocols/assets/Cargo.toml.tmpl

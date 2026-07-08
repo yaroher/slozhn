@@ -1,0 +1,18 @@
+[package]
+name = "browser-app-core"
+version = "0.0.0"
+publish = false
+edition.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+slozhn = { path = "../../../crates/slozhn" }
+slozhn-proto = { path = "../../../crates/slozhn-proto" }
+tonic = { version = "0.14", default-features = false, features = ["codegen"] }
+bytes.workspace = true
+futures.workspace = true
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"

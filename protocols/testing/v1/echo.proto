@@ -1,0 +1,15 @@
+syntax = "proto3";
+
+package testing.v1;
+
+// Phase 2 test service: all 4 streaming kinds + an error with metadata.
+service Echo {
+  rpc Unary(Msg) returns (Msg);
+  rpc ServerStream(Count) returns (stream Msg);
+  rpc ClientStream(stream Msg) returns (Msg);
+  rpc Bidi(stream Msg) returns (stream Msg);
+  rpc Fail(Msg) returns (Msg);
+}
+
+message Msg { bytes payload = 1; }
+message Count { uint32 n = 1; }
