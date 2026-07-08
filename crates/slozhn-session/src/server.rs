@@ -129,6 +129,12 @@ impl SessionManager {
                 pending_out: VecDeque::new(),
                 ack_timer: None,
                 ack_delay: self.config.session.ack_delay,
+                idle_timeout: self.config.session.keepalive_interval.map(|i| {
+                    // клиент пингует каждые interval; даём 2 интервала + его
+                    // pong-таймаут, прежде чем счесть транспорт мёртвым
+                    i * 2 + self.config.session.keepalive_timeout
+                }),
+                idle_timer: None,
                 attach_rx,
                 attach_closed: false,
                 frame_config: self.config.frame.clone(),
@@ -227,6 +233,10 @@ pub struct ServerSessionTransport {
     pending_out: VecDeque<Frame>,
     ack_timer: Option<futures_timer::Delay>,
     ack_delay: Duration,
+    /// Idle detector: no inbound frames for this long while Active → detach
+    /// (the client pings every keepalive_interval, so silence means a break).
+    idle_timeout: Option<Duration>,
+    idle_timer: Option<futures_timer::Delay>,
     attach_rx: mpsc::UnboundedReceiver<(BoxFrameTransport, u64)>,
     attach_closed: bool,
     frame_config: slozhn_frame::connection::Config,
@@ -344,6 +354,25 @@ impl Stream for ServerSessionTransport {
                 },
 
                 SPhase::Active(t) => {
+                    // idle detector: prolonged silence = dead transport
+                    if let Some(timeout) = this.idle_timeout {
+                        if this.idle_timer.is_none() {
+                            let mut d = futures_timer::Delay::new(timeout);
+                            let _ = Pin::new(&mut d).poll(cx);
+                            this.idle_timer = Some(d);
+                        }
+                        if let Some(d) = &mut this.idle_timer
+                            && Pin::new(d).poll(cx).is_ready()
+                        {
+                            tracing::warn!(
+                                timeout_ms = timeout.as_millis(),
+                                "server session transport idle; detaching",
+                            );
+                            this.idle_timer = None;
+                            this.detach();
+                            continue;
+                        }
+                    }
                     if let Some(d) = &mut this.ack_timer
                         && Pin::new(d).poll(cx).is_ready()
                     {
@@ -358,25 +387,33 @@ impl Stream for ServerSessionTransport {
                         continue;
                     }
                     match t.poll_next_unpin(cx) {
-                        Poll::Ready(Some(f)) => match this.core.on_ingress(f) {
-                            Ingress::Deliver { frame: f, ack_due } => {
-                                if matches!(f.kind, Some(frame::Kind::Hello(_))) {
-                                    continue;
-                                }
-                                if ack_due {
-                                    let a = this.core.make_ack();
-                                    this.pending_out.push_back(a);
-                                } else if this.core.ack_pending() && this.ack_timer.is_none() {
-                                    this.ack_timer =
-                                        Some(futures_timer::Delay::new(this.ack_delay));
-                                    if let Some(d) = &mut this.ack_timer {
-                                        let _ = Pin::new(d).poll(cx);
-                                    }
-                                }
-                                return Poll::Ready(Some(f));
+                        Poll::Ready(Some(f)) => {
+                            // any inbound frame resets the idle detector
+                            if let Some(timeout) = this.idle_timeout {
+                                let mut d = futures_timer::Delay::new(timeout);
+                                let _ = Pin::new(&mut d).poll(cx);
+                                this.idle_timer = Some(d);
                             }
-                            Ingress::Consumed => continue,
-                        },
+                            match this.core.on_ingress(f) {
+                                Ingress::Deliver { frame: f, ack_due } => {
+                                    if matches!(f.kind, Some(frame::Kind::Hello(_))) {
+                                        continue;
+                                    }
+                                    if ack_due {
+                                        let a = this.core.make_ack();
+                                        this.pending_out.push_back(a);
+                                    } else if this.core.ack_pending() && this.ack_timer.is_none() {
+                                        this.ack_timer =
+                                            Some(futures_timer::Delay::new(this.ack_delay));
+                                        if let Some(d) = &mut this.ack_timer {
+                                            let _ = Pin::new(d).poll(cx);
+                                        }
+                                    }
+                                    return Poll::Ready(Some(f));
+                                }
+                                Ingress::Consumed => continue,
+                            }
+                        }
                         Poll::Ready(None) => {
                             this.detach();
                             continue;

@@ -147,7 +147,6 @@ pub mod echo_client {
                 .insert(GrpcMethod::new("testing.v1.Echo", "ClientStream"));
             self.inner.client_streaming(req, path, codec).await
         }
-        ///
         pub async fn bidi(
             &mut self,
             request: impl tonic::IntoStreamingRequest<Message = super::Msg>,
@@ -232,7 +231,6 @@ pub mod echo_server {
             >
             + std::marker::Send
             + 'static;
-        ///
         async fn bidi(
             &self,
             request: tonic::Request<tonic::Streaming<super::Msg>>,

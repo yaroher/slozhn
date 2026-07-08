@@ -6,16 +6,20 @@
 //!   `tracing_subscriber::fmt` and these are your logs; wire
 //!   `tracing-opentelemetry` and they are your traces. The `otel` feature
 //!   adds W3C `traceparent` propagation (client inject / server extract).
-//! - [`RetryLayer`] — client-side unary retries on `UNAVAILABLE`: the request
-//!   body is buffered up to a cap and replayed with jittered backoff;
-//!   streaming requests (or bodies above the cap) pass through untouched.
+//! - [`RetryLayer`] — client-side unary retries on `UNAVAILABLE`, gated by
+//!   protobuf `idempotency_level` descriptors or explicit method allowlists.
+//!   The request body is buffered up to a cap and replayed with jittered
+//!   backoff; streaming requests (or bodies above the cap) pass through
+//!   untouched.
 //!
 //! Client wiring:
 //! ```ignore
 //! let channel = slozhn::client::builder(url).resume().build();
 //! let stack = tower::ServiceBuilder::new()
 //!     .layer(slozhn::middleware::TraceLayer::client())
-//!     .layer(slozhn::middleware::RetryLayer::default())
+//!     .layer(slozhn::middleware::RetryLayer::from_file_descriptor_set(
+//!         my_proto::FILE_DESCRIPTOR_SET,
+//!     )?)
 //!     .service(channel);
 //! let client = EchoClient::new(stack);
 //! ```
@@ -28,6 +32,7 @@
 //! ```
 
 mod auth;
+mod idempotency;
 mod retry;
 mod trace;
 
@@ -35,8 +40,11 @@ mod trace;
 mod otel;
 
 pub use auth::{
-    bearer, AuthError, AuthFn, AuthLayer, AuthService, AuthTokenLayer, AuthTokenService,
-    Identity,
+    AuthError, AuthFn, AuthLayer, AuthService, AuthTokenLayer, AuthTokenService, Identity, bearer,
 };
-pub use retry::{RetryLayer, RetryService};
-pub use trace::{trace_server, ServerTraced, TraceLayer, TraceService};
+pub use idempotency::{
+    IDEMPOTENCY_KEY_METADATA, IdempotencyIndex, IdempotencyKeyLayer, IdempotencyKeyService,
+    IdempotencyLevel,
+};
+pub use retry::{RetryLayer, RetryPolicy, RetryService};
+pub use trace::{ServerTraced, TraceLayer, TraceService, trace_server};

@@ -27,6 +27,13 @@ pub struct SessionConfig {
     pub initial_backoff: Duration,
     /// Backoff ceiling.
     pub max_backoff: Duration,
+    /// Physical-transport keepalive: the client pings while Active and treats
+    /// a missing Pong as a break (goes into reconnect); the server treats
+    /// prolonged silence as a break (detaches and waits for resume).
+    /// `None` disables liveness detection.
+    pub keepalive_interval: Option<Duration>,
+    /// How long the client waits for Pong before reconnecting.
+    pub keepalive_timeout: Duration,
 }
 
 impl Default for SessionConfig {
@@ -37,6 +44,8 @@ impl Default for SessionConfig {
             ack_delay: Duration::from_millis(250),
             initial_backoff: Duration::from_millis(100),
             max_backoff: Duration::from_secs(5),
+            keepalive_interval: Some(Duration::from_secs(30)),
+            keepalive_timeout: Duration::from_secs(10),
         }
     }
 }

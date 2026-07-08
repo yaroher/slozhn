@@ -2,7 +2,6 @@
 
 use std::collections::HashMap;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 
@@ -18,12 +17,14 @@ use slozhn_frame::{Connection, TransportClosed};
 
 #[derive(Default)]
 struct RegistryInner {
-    next_id: AtomicU64,
     state: Mutex<RegistryState>,
 }
 
 #[derive(Default)]
 struct RegistryState {
+    /// Lives under the same lock as the map: register() is the only writer
+    /// and it locks anyway — a separate atomic buys nothing.
+    next_id: u64,
     connections: HashMap<u64, Connection>,
     draining: Option<GoAwayCode>,
 }
@@ -44,11 +45,12 @@ impl ConnectionRegistry {
     }
 
     fn register(&self, conn: Connection) -> ConnectionRegistration {
-        let id = self.inner.next_id.fetch_add(1, Ordering::Relaxed);
-        let draining = {
+        let (id, draining) = {
             let mut state = self.inner.state.lock().expect("connection registry lock");
+            let id = state.next_id;
+            state.next_id += 1;
             state.connections.insert(id, conn.clone());
-            state.draining
+            (id, state.draining)
         };
         tracing::debug!(
             registry_connection_id = id,
@@ -154,11 +156,26 @@ where
     S::Future: Send,
     S::Error: std::fmt::Display + Send,
 {
-    grpc_ws_with_registry(svc, ConnectionRegistry::new())
+    grpc_ws_inner(svc, None)
 }
 
 /// gRPC-over-WS handler with an externally controlled connection registry.
 pub fn grpc_ws_with_registry<S>(svc: S, registry: ConnectionRegistry) -> MethodRouter
+where
+    S: tower::Service<
+            http::Request<tonic::body::Body>,
+            Response = http::Response<tonic::body::Body>,
+        > + Clone
+        + Send
+        + Sync
+        + 'static,
+    S::Future: Send,
+    S::Error: std::fmt::Display + Send,
+{
+    grpc_ws_inner(svc, Some(registry))
+}
+
+fn grpc_ws_inner<S>(svc: S, registry: Option<ConnectionRegistry>) -> MethodRouter
 where
     S: tower::Service<
             http::Request<tonic::body::Body>,
@@ -177,7 +194,8 @@ where
             ws.on_upgrade(move |socket| async move {
                 let transport = framed(AxumWs { inner: socket });
                 let (conn, driver) = bind(Side::Server, Config::default(), transport);
-                let _registration = registry.register(conn.clone());
+                // no registry supplied → no bookkeeping cost per connection
+                let _registration = registry.as_ref().map(|r| r.register(conn.clone()));
                 tokio::spawn(async move {
                     if let Err(error) = driver.run().await {
                         tracing::debug!(%error, "server ws connection driver stopped");
@@ -205,7 +223,7 @@ where
     S::Future: Send,
     S::Error: std::fmt::Display + Send,
 {
-    grpc_ws_session_with_registry(svc, manager, ConnectionRegistry::new())
+    grpc_ws_session_inner(svc, manager, None)
 }
 
 /// gRPC-over-WS with session resume and an externally controlled connection registry.
@@ -213,6 +231,25 @@ pub fn grpc_ws_session_with_registry<S>(
     svc: S,
     manager: std::sync::Arc<slozhn_session::server::SessionManager>,
     registry: ConnectionRegistry,
+) -> MethodRouter
+where
+    S: tower::Service<
+            http::Request<tonic::body::Body>,
+            Response = http::Response<tonic::body::Body>,
+        > + Clone
+        + Send
+        + Sync
+        + 'static,
+    S::Future: Send,
+    S::Error: std::fmt::Display + Send,
+{
+    grpc_ws_session_inner(svc, manager, Some(registry))
+}
+
+fn grpc_ws_session_inner<S>(
+    svc: S,
+    manager: std::sync::Arc<slozhn_session::server::SessionManager>,
+    registry: Option<ConnectionRegistry>,
 ) -> MethodRouter
 where
     S: tower::Service<
@@ -244,7 +281,8 @@ where
                             client_hello,
                             session_transport,
                         );
-                        let _registration = registry.register(conn.clone());
+                        let _registration =
+                            registry.as_ref().map(|r| r.register(conn.clone()));
                         tokio::spawn(async move {
                             if let Err(error) = driver.run().await {
                                 tracing::debug!(%error, "server session ws connection driver stopped");

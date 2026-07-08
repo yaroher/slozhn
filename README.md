@@ -37,7 +37,9 @@ generate:
   plugins:
     - name: prost
       out: gen/src
-      opts: { bytes: "." }
+      opts:
+        bytes: "."
+        file_descriptor_set: true
     - name: tonic
       out: gen/src
       opts: { no_transport: "true" }   # keep wasm builds possible
@@ -45,6 +47,21 @@ generate:
 
 ```bash
 easyp generate
+```
+
+Mark retry-safe unary RPCs in protobuf and pass the generated descriptor set
+to `RetryLayer`:
+
+```proto
+import "google/protobuf/descriptor.proto";
+
+rpc GetUser(GetUserRequest) returns (GetUserResponse) {
+  option idempotency_level = NO_SIDE_EFFECTS;
+}
+
+rpc PutSettings(PutSettingsRequest) returns (PutSettingsResponse) {
+  option idempotency_level = IDEMPOTENT;
+}
 ```
 
 ### 2. Server (axum)
@@ -195,10 +212,12 @@ registry.drain_all(slozhn::frame::GoAwayCode::Graceful);
 Ready-made tower layers, usable on both sides:
 
 ```rust
-// client: logging/tracing + unary retries
+// client: logging/tracing + descriptor-driven unary retries
 let stack = tower::ServiceBuilder::new()
     .layer(slozhn::middleware::TraceLayer::client())
-    .layer(slozhn::middleware::RetryLayer::default())
+    .layer(slozhn::middleware::RetryLayer::from_file_descriptor_set(
+        my_proto::FILE_DESCRIPTOR_SET,
+    )?)
     .service(channel);
 let client = EchoClient::new(stack);
 
@@ -211,9 +230,50 @@ Router::new().route("/rpc", slozhn::server::grpc_ws(traced));
 (`rpc.system/service/method`, `rpc.grpc.status_code`) plus start/finish
 events — hook up `tracing_subscriber::fmt` for logs or `tracing-opentelemetry`
 for traces; the `otel` feature adds W3C `traceparent` propagation.
-`RetryLayer` retries unary calls on `UNAVAILABLE` with jittered backoff,
-buffering bodies up to 256 KiB; streaming requests are never replayed.
-Retried calls may execute twice server-side — enable for idempotent methods.
+`RetryLayer::default()` is deny-by-default. It retries unary calls on
+`UNAVAILABLE` only when the protobuf descriptor marks the RPC
+`NO_SIDE_EFFECTS`/`IDEMPOTENT`, or when you explicitly allow a method:
+
+```rust
+let retry = slozhn::middleware::RetryLayer::from_file_descriptor_set(
+    my_proto::FILE_DESCRIPTOR_SET,
+)?
+.retry_method("/legacy.v1.Legacy/Get")
+.never_retry_method("/legacy.v1.Legacy/Create");
+```
+
+Retried calls use jittered backoff and buffer request bodies up to 256 KiB;
+streaming requests are never replayed. A retried RPC may execute twice
+server-side — use `unsafe_retry_all_buffered()` only when the wrapped client is
+already scoped to idempotent methods.
+
+### Descriptor-driven idempotency & retries
+
+Mark methods with the STANDARD protobuf option — no custom extensions:
+
+```protobuf
+rpc Upsert(Req) returns (Resp) { option idempotency_level = IDEMPOTENT; }
+rpc Get(Req) returns (Resp)    { option idempotency_level = NO_SIDE_EFFECTS; }
+```
+
+With `file_descriptor_set: true` in the prost generator options, the embedded
+`FILE_DESCRIPTOR_SET` drives the client stack automatically:
+
+```rust
+let fds = my_proto::FILE_DESCRIPTOR_SET;
+let idx = Arc::new(IdempotencyIndex::from_descriptor_set(fds)?);
+
+let stack = tower::ServiceBuilder::new()
+    .layer(IdempotencyKeyLayer::new(idx))               // x-idempotency-key on IDEMPOTENT calls
+    .layer(RetryLayer::from_file_descriptor_set(fds)?)  // retries ONLY marked methods
+    .service(channel);
+```
+
+`RetryLayer` is safe-by-default: without an allow source it retries nothing;
+explicit `never_retry_method(...)` entries win over descriptors. The index
+takes manual markers in the same builder style — `idempotent_method(...)`,
+`no_side_effects_methods([...])`, `unknown_method(...)` (overrides a
+descriptor marker) — for methods you can't annotate.
 
 ### Authentication
 

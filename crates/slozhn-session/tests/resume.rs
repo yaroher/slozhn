@@ -7,9 +7,9 @@ use std::time::Duration;
 use bytes::Bytes;
 use futures::{SinkExt, StreamExt};
 use slozhn_frame::loopback::{self, FramePipe};
-use slozhn_frame::proto::v1::{frame, Frame, Hello, Message};
-use slozhn_session::client::{connect_session, BoxFrameTransport, Factory};
+use slozhn_frame::proto::v1::{Frame, Hello, Message, frame};
 use slozhn_session::SessionConfig;
+use slozhn_session::client::{BoxFrameTransport, Factory, connect_session};
 
 fn msg(stream_id: u64, tag: u8) -> Frame {
     Frame {
@@ -57,8 +57,10 @@ fn quiet_session_config() -> SessionConfig {
         replay_buffer_bytes: 4096,
         initial_backoff: std::time::Duration::from_millis(50),
         max_backoff: std::time::Duration::from_millis(100),
-        ack_every: 1000,                      // acks don't interfere with the scenario
-        ack_delay: Duration::from_secs(600),  // timer won't fire
+        keepalive_interval: None, // детерминированные тесты — без пингов
+        keepalive_timeout: std::time::Duration::from_secs(10),
+        ack_every: 1000,                     // acks don't interfere with the scenario
+        ack_delay: Duration::from_secs(600), // timer won't fire
     }
 }
 
@@ -222,7 +224,63 @@ async fn kick_breaks_session_backoff() {
     pump(&mut transport).await;
     let cur = state.borrow().clone();
     assert!(
-        matches!(cur, ConnState::Connecting | ConnState::Backoff { attempt: 2.., .. }),
+        matches!(
+            cur,
+            ConnState::Connecting | ConnState::Backoff { attempt: 2.., .. }
+        ),
         "kick must force an immediate attempt, got {cur:?}"
     );
+}
+
+#[tokio::test]
+async fn keepalive_detects_silent_peer_and_reconnects() {
+    use slozhn_frame::transport::ReconnectHooks;
+    use slozhn_session::client::connect_session_hooked;
+
+    let (factory, mut srv_rx) = make_factory();
+    let (hooks, _state) = ReconnectHooks::new();
+
+    let cfg = SessionConfig {
+        keepalive_interval: Some(Duration::from_millis(50)),
+        keepalive_timeout: Duration::from_millis(50),
+        ..quiet_session_config()
+    };
+    let connect = tokio::spawn(connect_session_hooked(
+        factory,
+        slozhn_frame::connection::Config::default(),
+        cfg,
+        hooks,
+    ));
+    let mut srv1 = srv_rx.recv().await.expect("first transport");
+    let _client_hello = srv1.next().await.expect("client hello");
+    srv1.send(hello(b"s1", b"t1", 0, false)).await.unwrap();
+    let (mut transport, _peer) = connect.await.unwrap().expect("connected");
+
+    // сервер ЖИВ (pipe не рвём), но МОЛЧИТ: Ping придёт — Pong не отправим.
+    // Клиентский keepalive обязан счесть транспорт мёртвым и реконнектнуться.
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    let second = loop {
+        pump(&mut transport).await;
+        if let Ok(t) =
+            tokio::time::timeout(Duration::from_millis(50), srv_rx.recv()).await
+        {
+            break t.expect("second transport");
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "keepalive must trigger a reconnect against a silent peer"
+        );
+    };
+    drop(second);
+    // и Ping реально уходил на первый транспорт
+    let mut saw_ping = false;
+    while let Ok(Some(f)) =
+        tokio::time::timeout(Duration::from_millis(100), srv1.next()).await
+    {
+        if matches!(f.kind, Some(frame::Kind::Ping(_))) {
+            saw_ping = true;
+            break;
+        }
+    }
+    assert!(saw_ping, "client must have sent a keepalive ping");
 }

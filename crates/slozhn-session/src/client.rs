@@ -110,6 +110,12 @@ pub async fn connect_session_hooked(
         pending_out: VecDeque::new(),
         ack_timer: None,
         ack_delay: session_config.ack_delay,
+        ka_timer: session_config
+            .keepalive_interval
+            .map(futures_timer::Delay::new),
+        ka_waiting: false,
+        keepalive_interval: session_config.keepalive_interval,
+        keepalive_timeout: session_config.keepalive_timeout,
         backoff_cur: session_config.initial_backoff,
         backoff_start: session_config.initial_backoff,
         backoff_max: session_config.max_backoff,
@@ -161,6 +167,12 @@ pub struct SessionTransport {
     pending_out: VecDeque<Frame>,
     ack_timer: Option<futures_timer::Delay>,
     ack_delay: Duration,
+    /// Physical keepalive (Active phase): armed to interval, then to timeout
+    /// while waiting for any inbound frame after our Ping.
+    ka_timer: Option<futures_timer::Delay>,
+    ka_waiting: bool,
+    keepalive_interval: Option<Duration>,
+    keepalive_timeout: Duration,
     backoff_cur: Duration,
     backoff_start: Duration,
     backoff_max: Duration,
@@ -210,6 +222,8 @@ impl SessionTransport {
         );
         self.pending_out.clear();
         self.ack_timer = None;
+        self.ka_timer = None;
+        self.ka_waiting = false;
         self.kick_wait = None;
         self.hooks.set(ConnState::Connecting);
         self.phase = Phase::Connecting((self.factory)());
@@ -319,6 +333,9 @@ impl Stream for SessionTransport {
                                 else {
                                     unreachable!()
                                 };
+                                this.ka_waiting = false;
+                                this.ka_timer =
+                                    this.keepalive_interval.map(futures_timer::Delay::new);
                                 this.phase = Phase::Active(t);
                             }
                             _ => {
@@ -338,6 +355,37 @@ impl Stream for SessionTransport {
                 }
 
                 Phase::Active(t) => {
+                    // 0. physical keepalive: ping on idle, reconnect on silence
+                    if let Some(interval) = this.keepalive_interval
+                        && let Some(d) = &mut this.ka_timer
+                        && Pin::new(d).poll(cx).is_ready()
+                    {
+                        if this.ka_waiting {
+                            tracing::warn!(
+                                session_id = %this.session_log_id,
+                                timeout_ms = this.keepalive_timeout.as_millis(),
+                                "session keepalive timed out; reconnecting",
+                            );
+                            this.go_reconnect();
+                            continue;
+                        }
+                        tracing::trace!(
+                            session_id = %this.session_log_id,
+                            interval_ms = interval.as_millis(),
+                            "sending session keepalive ping",
+                        );
+                        this.pending_out.push_back(Frame {
+                            stream_id: 0,
+                            seq: 0,
+                            kind: Some(frame::Kind::Ping(slozhn_frame::proto::v1::Ping {
+                                opaque: u64::MAX,
+                            })),
+                        });
+                        this.ka_waiting = true;
+                        let mut d = futures_timer::Delay::new(this.keepalive_timeout);
+                        let _ = Pin::new(&mut d).poll(cx); // register waker
+                        this.ka_timer = Some(d);
+                    }
                     // 1. ack timer
                     if let Some(d) = &mut this.ack_timer
                         && Pin::new(d).poll(cx).is_ready()
@@ -358,26 +406,35 @@ impl Stream for SessionTransport {
                     }
                     // 3. receive
                     match t.poll_next_unpin(cx) {
-                        Poll::Ready(Some(f)) => match this.core.on_ingress(f) {
-                            Ingress::Deliver { frame: f, ack_due } => {
-                                if matches!(f.kind, Some(frame::Kind::Hello(_))) {
-                                    continue; // repeated Hello — not for the driver
-                                }
-                                if ack_due {
-                                    let a = this.core.make_ack();
-                                    this.pending_out.push_back(a);
-                                } else if this.core.ack_pending() && this.ack_timer.is_none() {
-                                    this.ack_timer =
-                                        Some(futures_timer::Delay::new(this.ack_delay));
-                                    // arm the timer (registers the waker)
-                                    if let Some(d) = &mut this.ack_timer {
-                                        let _ = Pin::new(d).poll(cx);
-                                    }
-                                }
-                                return Poll::Ready(Some(f));
+                        Poll::Ready(Some(f)) => {
+                            // any inbound frame proves the transport is alive
+                            if let Some(interval) = this.keepalive_interval {
+                                this.ka_waiting = false;
+                                let mut d = futures_timer::Delay::new(interval);
+                                let _ = Pin::new(&mut d).poll(cx);
+                                this.ka_timer = Some(d);
                             }
-                            Ingress::Consumed => continue,
-                        },
+                            match this.core.on_ingress(f) {
+                                Ingress::Deliver { frame: f, ack_due } => {
+                                    if matches!(f.kind, Some(frame::Kind::Hello(_))) {
+                                        continue; // repeated Hello — not for the driver
+                                    }
+                                    if ack_due {
+                                        let a = this.core.make_ack();
+                                        this.pending_out.push_back(a);
+                                    } else if this.core.ack_pending() && this.ack_timer.is_none() {
+                                        this.ack_timer =
+                                            Some(futures_timer::Delay::new(this.ack_delay));
+                                        // arm the timer (registers the waker)
+                                        if let Some(d) = &mut this.ack_timer {
+                                            let _ = Pin::new(d).poll(cx);
+                                        }
+                                    }
+                                    return Poll::Ready(Some(f));
+                                }
+                                Ingress::Consumed => continue,
+                            }
+                        }
                         Poll::Ready(None) => {
                             this.go_reconnect();
                             continue;

@@ -7,6 +7,7 @@ generate:
       out: crates/slozhn-proto/src
       opts:
         bytes: "."
+        file_descriptor_set: true
     - name: tonic
       out: crates/slozhn-proto/src
       opts:

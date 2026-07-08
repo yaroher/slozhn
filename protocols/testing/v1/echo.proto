@@ -2,9 +2,13 @@ syntax = "proto3";
 
 package testing.v1;
 
+import "google/protobuf/descriptor.proto";
+
 // Phase 2 test service: all 4 streaming kinds + an error with metadata.
 service Echo {
-  rpc Unary(Msg) returns (Msg);
+  rpc Unary(Msg) returns (Msg) {
+    option idempotency_level = IDEMPOTENT;
+  }
   rpc ServerStream(Count) returns (stream Msg);
   rpc ClientStream(stream Msg) returns (Msg);
   rpc Bidi(stream Msg) returns (stream Msg);

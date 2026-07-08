@@ -4,7 +4,7 @@
 use std::collections::VecDeque;
 
 use prost::Message as _;
-use slozhn_frame::proto::v1::{frame, Frame};
+use slozhn_frame::proto::v1::{Frame, frame};
 
 use crate::SessionError;
 
@@ -78,7 +78,10 @@ impl SessionCore {
             return Ingress::Consumed;
         }
         if !sessioned(&f) {
-            return Ingress::Deliver { frame: f, ack_due: false };
+            return Ingress::Deliver {
+                frame: f,
+                ack_due: false,
+            };
         }
         if f.seq <= self.last_recv_seq {
             return Ingress::Consumed; // duplicate after replay
@@ -145,7 +148,9 @@ mod tests {
         Frame {
             stream_id: 0,
             seq: 0,
-            kind: Some(frame::Kind::Ack(slozhn_frame::proto::v1::Ack { last_seq: last })),
+            kind: Some(frame::Kind::Ack(slozhn_frame::proto::v1::Ack {
+                last_seq: last,
+            })),
         }
     }
 
@@ -208,7 +213,10 @@ mod tests {
         }
         let mut f = msg(1);
         f.seq = 3;
-        assert!(matches!(c.on_ingress(f), Ingress::Deliver { ack_due: true, .. }));
+        assert!(matches!(
+            c.on_ingress(f),
+            Ingress::Deliver { ack_due: true, .. }
+        ));
         let a = c.make_ack();
         assert!(matches!(a.kind, Some(frame::Kind::Ack(a)) if a.last_seq == 3));
         assert!(!c.ack_pending());
