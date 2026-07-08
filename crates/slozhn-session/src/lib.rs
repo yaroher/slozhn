@@ -23,6 +23,10 @@ pub struct SessionConfig {
     pub ack_every: u32,
     /// …or this long after the first unacknowledged one.
     pub ack_delay: Duration,
+    /// First reconnect backoff (jittered, doubles per attempt).
+    pub initial_backoff: Duration,
+    /// Backoff ceiling.
+    pub max_backoff: Duration,
 }
 
 impl Default for SessionConfig {
@@ -31,6 +35,8 @@ impl Default for SessionConfig {
             replay_buffer_bytes: 1024 * 1024,
             ack_every: 16,
             ack_delay: Duration::from_millis(250),
+            initial_backoff: Duration::from_millis(100),
+            max_backoff: Duration::from_secs(5),
         }
     }
 }

@@ -3,7 +3,7 @@ SHELL := bash
 .SHELLFLAGS := -eu -o pipefail -c
 
 # Publish order matters: dependencies first.
-CRATES := slozhn-proto slozhn-frame slozhn-ws slozhn-client slozhn-session slozhn-server slozhn
+CRATES := slozhn-proto slozhn-frame slozhn-ws slozhn-client slozhn-session slozhn-server slozhn-middleware slozhn
 
 .PHONY: help gen test test-wasm test-browser doc release publish-crates
 

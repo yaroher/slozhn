@@ -18,5 +18,8 @@ pub mod client;
 #[cfg(all(feature = "server", not(target_arch = "wasm32")))]
 pub mod server;
 
+#[cfg(feature = "middleware")]
+pub use slozhn_middleware as middleware;
+
 pub use slozhn_frame as frame;
 pub use slozhn_session::{SessionConfig, SessionError};

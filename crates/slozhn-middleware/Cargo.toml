@@ -1,0 +1,31 @@
+[package]
+name = "slozhn-middleware"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Ready-made tower layers for slozhn: tracing/logging (OTel semconv), retries"
+
+[features]
+default = []
+# W3C traceparent propagation (client inject / server extract)
+otel = ["dep:opentelemetry", "dep:tracing-opentelemetry"]
+
+[dependencies]
+tower = { version = "0.5", default-features = false, features = ["util"] }
+tonic = { version = "0.14", default-features = false, features = ["codegen"] }
+http = "1"
+http-body = "1"
+http-body-util = "0.1"
+bytes.workspace = true
+futures.workspace = true
+tracing = "0.1"
+pin-project-lite = "0.2"
+futures-timer = { version = "3", features = ["wasm-bindgen"] }
+fastrand = "2"
+opentelemetry = { version = "0.32", optional = true }
+tracing-opentelemetry = { version = "0.33", optional = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
+tracing-subscriber = "0.3"

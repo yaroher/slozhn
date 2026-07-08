@@ -55,6 +55,8 @@ fn make_factory() -> (Factory, tokio::sync::mpsc::UnboundedReceiver<FramePipe>) 
 fn quiet_session_config() -> SessionConfig {
     SessionConfig {
         replay_buffer_bytes: 4096,
+        initial_backoff: std::time::Duration::from_millis(50),
+        max_backoff: std::time::Duration::from_millis(100),
         ack_every: 1000,                      // acks don't interfere with the scenario
         ack_delay: Duration::from_secs(600),  // timer won't fire
     }
@@ -165,4 +167,62 @@ async fn resume_rejected_ends_transport() {
         .await
         .expect("must finish");
     assert!(end.is_none());
+}
+
+#[tokio::test]
+async fn kick_breaks_session_backoff() {
+    use slozhn_frame::transport::{ConnState, ReconnectHooks};
+    use slozhn_session::client::connect_session_hooked;
+
+    // factory: 1-й вызов — живой пайп, дальше всегда ошибка (сервера «нет»)
+    let (pipe_tx, pipe_rx) = tokio::sync::mpsc::unbounded_channel::<FramePipe>();
+    let first = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let factory: slozhn_session::client::Factory = std::sync::Arc::new(move || {
+        let first = first.clone();
+        let pipe_tx = pipe_tx.clone();
+        Box::pin(async move {
+            if first.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                let (a, b) = loopback::pair();
+                pipe_tx.send(b).map_err(|_| "test dropped".to_string())?;
+                Ok(Box::pin(a) as slozhn_session::client::BoxFrameTransport)
+            } else {
+                Err("server down".to_string())
+            }
+        })
+    });
+    let (hooks, state) = ReconnectHooks::new();
+
+    let connect = tokio::spawn(connect_session_hooked(
+        factory,
+        slozhn_frame::connection::Config::default(),
+        quiet_session_config(),
+        hooks.clone(),
+    ));
+    let mut srv_rx = pipe_rx;
+    let mut srv1 = srv_rx.recv().await.expect("first transport");
+    let _client_hello = srv1.next().await.expect("client hello");
+    srv1.send(hello(b"s1", b"t1", 0, false)).await.unwrap();
+    let (mut transport, _peer) = connect.await.unwrap().expect("connected");
+    assert_eq!(*state.borrow(), ConnState::Connected);
+
+    drop(srv1); // разрыв; все реконнекты падают → backoff-и
+
+    // прокачиваем машину, ждём Backoff{attempt >= 1}
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    loop {
+        pump(&mut transport).await;
+        if matches!(*state.borrow(), ConnState::Backoff { .. }) {
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline, "no backoff observed");
+    }
+
+    // kick: следующий poll должен немедленно уйти в Connecting
+    hooks.kick.notify_waiters();
+    pump(&mut transport).await;
+    let cur = state.borrow().clone();
+    assert!(
+        matches!(cur, ConnState::Connecting | ConnState::Backoff { attempt: 2.., .. }),
+        "kick must force an immediate attempt, got {cur:?}"
+    );
 }

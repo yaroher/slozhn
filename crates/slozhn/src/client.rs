@@ -14,6 +14,7 @@ pub fn builder(url: impl Into<String>) -> ChannelBuilder {
     ChannelBuilder {
         url: url.into(),
         resume: None,
+        resume_explicit: false,
         reconnect: AutoConfig::default(),
         frame: slozhn_frame::connection::Config::default(),
         headers: http::HeaderMap::new(),
@@ -23,6 +24,7 @@ pub fn builder(url: impl Into<String>) -> ChannelBuilder {
 pub struct ChannelBuilder {
     url: String,
     resume: Option<SessionConfig>,
+    resume_explicit: bool,
     reconnect: AutoConfig,
     frame: slozhn_frame::connection::Config,
     headers: http::HeaderMap,
@@ -30,13 +32,17 @@ pub struct ChannelBuilder {
 
 impl ChannelBuilder {
     /// Enable the session layer: streams survive disconnects (spec §8).
+    /// The session reconnect backoff inherits `reconnect_config`; use
+    /// [`Self::resume_with`] to control it independently.
     pub fn resume(mut self) -> Self {
         self.resume = Some(SessionConfig::default());
+        self.resume_explicit = false;
         self
     }
 
     pub fn resume_with(mut self, cfg: SessionConfig) -> Self {
         self.resume = Some(cfg);
+        self.resume_explicit = true;
         self
     }
 
@@ -69,14 +75,25 @@ impl ChannelBuilder {
             "browser WebSocket cannot set headers; use query params or cookies"
         );
 
-        let Self { url, resume, reconnect, frame, headers } = self;
+        let Self { url, mut resume, resume_explicit, reconnect, frame, headers } = self;
+        // .resume() (без явного конфига) наследует бэкофф из reconnect_config,
+        // независимо от порядка вызовов билдера
+        if let Some(cfg) = &mut resume
+            && !resume_explicit
+        {
+            cfg.initial_backoff = reconnect.initial_backoff;
+            cfg.max_backoff = reconnect.max_backoff;
+        }
         let headers = Arc::new(headers);
+        let (hooks, state_rx) = slozhn_frame::transport::ReconnectHooks::new();
+        let session_hooks = hooks.clone();
 
         let factory: TransportFactory = Arc::new(move || {
             let url = url.clone();
             let headers = headers.clone();
             let frame = frame.clone();
             let resume = resume.clone();
+            let session_hooks = session_hooks.clone();
             Box::pin(async move {
                 match resume {
                     None => {
@@ -93,8 +110,8 @@ impl ChannelBuilder {
                                 Box::pin(async move { raw_transport(&url, &headers).await })
                             })
                         };
-                        let (t, peer_hello) = slozhn_session::client::connect_session(
-                            ws_factory, frame, session_cfg,
+                        let (t, peer_hello) = slozhn_session::client::connect_session_hooked(
+                            ws_factory, frame, session_cfg, session_hooks.clone(),
                         )
                         .await
                         .map_err(|e| e.to_string())?;
@@ -103,7 +120,7 @@ impl ChannelBuilder {
                 }
             })
         });
-        AutoChannel::new(factory, default_spawner(), reconnect)
+        AutoChannel::with_hooks(factory, default_spawner(), reconnect, hooks, state_rx)
     }
 }
 

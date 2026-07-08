@@ -22,6 +22,8 @@ use futures::{Future, Sink, SinkExt, Stream, StreamExt};
 use slozhn_frame::proto::v1::{frame, Frame, Hello};
 use slozhn_frame::TransportClosed;
 
+use slozhn_frame::transport::{jittered, ConnState, ReconnectHooks};
+
 use crate::core::{sessioned, Ingress, SessionCore};
 use crate::{SessionConfig, SessionError};
 
@@ -30,9 +32,6 @@ pub use slozhn_frame::transport::{BoxFrameTransport, FrameDuplex};
 pub type Factory =
     Arc<dyn Fn() -> BoxFuture<'static, Result<BoxFrameTransport, String>> + Send + Sync>;
 
-const BACKOFF_START: Duration = Duration::from_millis(100);
-const BACKOFF_MAX: Duration = Duration::from_secs(5);
-
 /// First connect + Hello handshake of a new session. Returns the transport
 /// and the server's Hello — for `bind_pre_negotiated`.
 pub async fn connect_session(
@@ -40,6 +39,20 @@ pub async fn connect_session(
     frame_config: slozhn_frame::connection::Config,
     session_config: SessionConfig,
 ) -> Result<(SessionTransport, Hello), SessionError> {
+    let (hooks, _rx) = ReconnectHooks::new();
+    connect_session_hooked(factory, frame_config, session_config, hooks).await
+}
+
+/// Like [`connect_session`], but reporting reconnect state into an external
+/// hooks pair (see `slozhn_frame::transport::ReconnectHooks`); its `kick`
+/// punches through a backoff wait.
+pub async fn connect_session_hooked(
+    factory: Factory,
+    frame_config: slozhn_frame::connection::Config,
+    session_config: SessionConfig,
+    hooks: ReconnectHooks,
+) -> Result<(SessionTransport, Hello), SessionError> {
+    hooks.set(ConnState::Connecting);
     let mut t = (factory)()
         .await
         .map_err(SessionError::Handshake)?;
@@ -62,6 +75,7 @@ pub async fn connect_session(
             "server has no session support (use grpc_ws_session)".into(),
         ));
     }
+    hooks.set(ConnState::Connected);
     let transport = SessionTransport {
         phase: Phase::Active(t),
         core: SessionCore::new(session_config.replay_buffer_bytes, session_config.ack_every),
@@ -72,7 +86,12 @@ pub async fn connect_session(
         pending_out: VecDeque::new(),
         ack_timer: None,
         ack_delay: session_config.ack_delay,
-        backoff_cur: BACKOFF_START,
+        backoff_cur: session_config.initial_backoff,
+        backoff_start: session_config.initial_backoff,
+        backoff_max: session_config.max_backoff,
+        hooks,
+        attempt: 0,
+        kick_wait: None,
     };
     Ok((transport, peer))
 }
@@ -118,6 +137,12 @@ pub struct SessionTransport {
     ack_timer: Option<futures_timer::Delay>,
     ack_delay: Duration,
     backoff_cur: Duration,
+    backoff_start: Duration,
+    backoff_max: Duration,
+    hooks: ReconnectHooks,
+    attempt: u32,
+    /// Armed while in Backoff: reconnect_now() future.
+    kick_wait: Option<BoxFuture<'static, ()>>,
 }
 
 enum FlushOutcome {
@@ -150,6 +175,8 @@ impl SessionTransport {
     fn go_reconnect(&mut self) {
         self.pending_out.clear();
         self.ack_timer = None;
+        self.kick_wait = None;
+        self.hooks.set(ConnState::Connecting);
         self.phase = Phase::Connecting((self.factory)());
     }
 }
@@ -163,12 +190,24 @@ impl Stream for SessionTransport {
             match &mut this.phase {
                 Phase::Dead => return Poll::Ready(None),
 
-                Phase::Backoff(delay) => match Pin::new(delay).poll(cx) {
-                    Poll::Ready(()) => {
-                        this.phase = Phase::Connecting((this.factory)());
+                Phase::Backoff(delay) => {
+                    if this.kick_wait.is_none() {
+                        let kick = this.hooks.kick.clone();
+                        this.kick_wait = Some(Box::pin(async move { kick.notified().await }));
                     }
-                    Poll::Pending => return Poll::Pending,
-                },
+                    let kicked = matches!(
+                        this.kick_wait.as_mut().expect("armed above").as_mut().poll(cx),
+                        Poll::Ready(())
+                    );
+                    match Pin::new(delay).poll(cx) {
+                        Poll::Ready(()) => {}
+                        Poll::Pending if kicked => {} // reconnect_now() punched through
+                        Poll::Pending => return Poll::Pending,
+                    }
+                    this.kick_wait = None;
+                    this.hooks.set(ConnState::Connecting);
+                    this.phase = Phase::Connecting((this.factory)());
+                }
 
                 Phase::Connecting(fut) => match fut.as_mut().poll(cx) {
                     Poll::Ready(Ok(t)) => {
@@ -181,9 +220,12 @@ impl Stream for SessionTransport {
                         this.phase = Phase::Resuming(t);
                     }
                     Poll::Ready(Err(_)) => {
-                        let cur = this.backoff_cur;
-                        this.backoff_cur = (cur * 2).min(BACKOFF_MAX);
-                        this.phase = Phase::Backoff(futures_timer::Delay::new(cur));
+                        this.attempt += 1;
+                        let delay = jittered(this.backoff_cur);
+                        this.backoff_cur = (this.backoff_cur * 2).min(this.backoff_max);
+                        this.hooks
+                            .set(ConnState::Backoff { delay, attempt: this.attempt });
+                        this.phase = Phase::Backoff(futures_timer::Delay::new(delay));
                     }
                     Poll::Pending => return Poll::Pending,
                 },
@@ -200,10 +242,13 @@ impl Stream for SessionTransport {
                         Poll::Ready(Some(f)) => match f.kind {
                             Some(frame::Kind::Hello(h)) => {
                                 if h.resume_rejected {
+                                    this.hooks.set(ConnState::Disconnected);
                                     this.phase = Phase::Dead;
                                     return Poll::Ready(None);
                                 }
-                                this.backoff_cur = BACKOFF_START;
+                                this.backoff_cur = this.backoff_start;
+                                this.attempt = 0;
+                                this.hooks.set(ConnState::Connected);
                                 let replay = this.core.replay_after(h.last_recv_seq);
                                 this.pending_out.extend(replay);
                                 let Phase::Resuming(t) =
@@ -215,6 +260,7 @@ impl Stream for SessionTransport {
                             }
                             _ => {
                                 // garbage before Hello — protocol filth
+                                this.hooks.set(ConnState::Disconnected);
                                 this.phase = Phase::Dead;
                                 return Poll::Ready(None);
                             }

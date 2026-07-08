@@ -1,4 +1,4 @@
-import init, { Core } from "../../core/pkg/browser_app_core";
+import init, { Core, init_logging } from "../../core/pkg/browser_app_core";
 
 const $ = (id: string) => document.getElementById(id)!;
 const log = (line: string) => {
@@ -11,10 +11,21 @@ let core: Core | undefined;
 
 $("connect").addEventListener("click", async () => {
   await init();
+  init_logging(); // tracing → console браузера
   core = new Core(($("url") as HTMLInputElement).value);
+  core.on_state((s: string) => {
+    $("status").textContent = s;
+    log(`state: ${s}`);
+  });
   ($("unary") as HTMLButtonElement).disabled = false;
   ($("stream") as HTMLButtonElement).disabled = false;
+  ($("reconnect") as HTMLButtonElement).disabled = false;
   log("core created (lazy channel: connection opens on first call)");
+});
+
+$("reconnect").addEventListener("click", () => {
+  core?.reconnect_now();
+  log("reconnect_now()");
 });
 
 $("unary").addEventListener("click", async () => {

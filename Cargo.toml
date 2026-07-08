@@ -8,6 +8,7 @@ members = [
     "crates/slozhn-server",
     "crates/slozhn-ws",
     "crates/slozhn-session",
+    "crates/slozhn-middleware",
     "crates/slozhn-grpc-tests",
     "examples/echo-ws",
     "examples/echo-wasm",

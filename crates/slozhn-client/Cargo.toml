@@ -18,8 +18,11 @@ futures.workspace = true
 thiserror.workspace = true
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 # sync for reconnect state, time for backoff sleep
-tokio = { workspace = true, features = ["sync", "time"] }
+tokio = { workspace = true, features = ["sync", "time", "macros"] }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
-tokio = { workspace = true, features = ["sync"] }
+tokio = { workspace = true, features = ["sync", "macros"] }
 futures-timer = { version = "3", features = ["wasm-bindgen"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "macros", "time"] }

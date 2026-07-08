@@ -128,6 +128,72 @@ tonic client ──► Channel ──► [session] ──► codec ──► Web
 | `examples/echo-wasm` | Browser test suite (`./run-browser-tests.sh`, headless chrome) |
 | `examples/browser-app` | Live demo: TS UI (Vite) + Rust wasm core; survives server restarts |
 
+
+## Reconnect state & control
+
+The channel exposes its reconnect machinery:
+
+```rust
+let channel = slozhn::client::builder(url)
+    .reconnect_config(slozhn_client::reconnect::AutoConfig {
+        initial_backoff: Duration::from_millis(200),
+        max_backoff: Duration::from_secs(10),
+    })
+    .resume()   // session backoff inherits reconnect_config;
+                // .resume_with(SessionConfig{..}) to control it separately
+    .build();
+
+let mut state = channel.state(); // tokio watch: Idle/Connecting/Backoff{delay,attempt}/Connected/Disconnected
+channel.reconnect_now();         // punch through a backoff wait (a "retry now" button)
+```
+
+Backoff is exponential with equal jitter (default 100 ms → 5 s). `Backoff`
+carries the chosen delay and the attempt number — render your own countdown
+from receipt time (wasm has no portable clock, so no absolute deadline is
+exposed).
+
+## Middleware (feature `middleware`)
+
+Ready-made tower layers, usable on both sides:
+
+```rust
+// client: logging/tracing + unary retries
+let stack = tower::ServiceBuilder::new()
+    .layer(slozhn::middleware::TraceLayer::client())
+    .layer(slozhn::middleware::RetryLayer::default())
+    .service(channel);
+let client = EchoClient::new(stack);
+
+// server: same tracing around the tonic routes
+let traced = slozhn::middleware::trace_server(routes);
+Router::new().route("/rpc", slozhn::server::grpc_ws(traced));
+```
+
+`TraceLayer` emits a `tracing` span per RPC with OTel semconv fields
+(`rpc.system/service/method`, `rpc.grpc.status_code`) plus start/finish
+events — hook up `tracing_subscriber::fmt` for logs or `tracing-opentelemetry`
+for traces; the `otel` feature adds W3C `traceparent` propagation.
+`RetryLayer` retries unary calls on `UNAVAILABLE` with jittered backoff,
+buffering bodies up to 256 KiB; streaming requests are never replayed.
+Retried calls may execute twice server-side — enable for idempotent methods.
+
+### Logging in the browser
+
+`tracing` has no default output in wasm — route it to the devtools console
+with a wasm subscriber (see `examples/browser-app`):
+
+```rust
+// once at startup, in your wasm entry point:
+tracing_wasm::set_as_global_default();          // tracing-wasm = "0.2"
+console_error_panic_hook::set_once();           // panics → console too
+
+// then every TraceLayer'ed RPC logs "rpc started" / "rpc finished code=N"
+let stack = slozhn::middleware::TraceLayer::client().layer(channel);
+```
+
+On native the same events go to whatever `tracing_subscriber` you install
+(`tracing_subscriber::fmt::init()` for plain stdout logs).
+
 ## Developing this repo
 
 ```bash
