@@ -15,11 +15,11 @@ client = []
 server = ["dep:slozhn-server"]
 
 [dependencies]
-slozhn-frame = { path = "../slozhn-frame", version = "0.1.0" }
-slozhn-client = { path = "../slozhn-client", version = "0.1.0" }
-slozhn-session = { path = "../slozhn-session", version = "0.1.0" }
-slozhn-ws = { path = "../slozhn-ws", version = "0.1.0" }
-slozhn-server = { path = "../slozhn-server", version = "0.1.0", optional = true }
+slozhn-frame = { path = "../slozhn-frame", version = "1.0.0" }
+slozhn-client = { path = "../slozhn-client", version = "1.0.0" }
+slozhn-session = { path = "../slozhn-session", version = "1.0.0" }
+slozhn-ws = { path = "../slozhn-ws", version = "1.0.0" }
+slozhn-server = { path = "../slozhn-server", version = "1.0.0", optional = true }
 futures.workspace = true
 http = "1"
 
