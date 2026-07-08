@@ -14,6 +14,7 @@ thiserror.workspace = true
 futures.workspace = true
 # macros = only the proc-macro select!/join!, pulls no runtime — wasm-compatible
 tokio = { workspace = true, features = ["sync", "macros"] }
+tracing.workspace = true
 http = "1"
 http-body = "1"
 

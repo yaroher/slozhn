@@ -24,11 +24,10 @@ pub mod stream;
 pub mod transport;
 
 pub use connection::{
-    bind, bind_pre_negotiated, Config, Connection, ConnectionDriver, Incoming, RecvHalf, SendHalf,
+    Config, Connection, ConnectionDriver, Incoming, RecvHalf, SendHalf, WeakConnection, bind,
+    bind_pre_negotiated,
 };
-pub use error::{
-    ConnError, GoAwayCode, OpenError, ProtocolError, StreamError, TransportClosed,
-};
+pub use error::{ConnError, GoAwayCode, OpenError, ProtocolError, StreamError, TransportClosed};
 pub use ids::Side;
 pub use stream::StreamEvent;
 

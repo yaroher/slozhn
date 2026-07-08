@@ -18,4 +18,5 @@ bytes.workspace = true
 futures.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["sync", "macros", "rt"] }
+tracing.workspace = true
 axum = { version = "0.8", default-features = false, features = ["ws", "http1", "tokio"] }

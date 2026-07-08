@@ -1,16 +1,17 @@
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use bytes::Bytes;
 use futures::{Sink, SinkExt, Stream, StreamExt};
-use tokio::sync::{mpsc, oneshot, Mutex};
+use tokio::sync::{Mutex, mpsc, oneshot};
 
 use crate::error::{ConnError, GoAwayCode, OpenError, ProtocolError, StreamError, TransportClosed};
 use crate::flow::Window;
 use crate::ids::{Side, StreamIdAllocator};
 use crate::proto::v1::{
-    frame, Frame, GoAway, HalfClose, Headers, Hello, Message, Metadata, Open, Ping, Pong,
-    Status, WindowUpdate,
+    Frame, GoAway, HalfClose, Headers, Hello, Message, Metadata, Open, Ping, Pong, Status,
+    WindowUpdate, frame,
 };
 use crate::stream::{StreamEvent, StreamState};
 use crate::{DEFAULT_WINDOW, PROTOCOL_VERSION};
@@ -18,6 +19,7 @@ use crate::{DEFAULT_WINDOW, PROTOCOL_VERSION};
 /// How many recently closed stream ids we remember to tell a legal race
 /// (frames in flight after our terminal) apart from a protocol error.
 const RESET_IDS_CAP: usize = 1024;
+static NEXT_CONNECTION_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -73,6 +75,7 @@ pub(crate) enum Command {
     GoAway {
         code: GoAwayCode,
     },
+    Close,
 }
 
 /// Sending half of a stream.
@@ -120,7 +123,12 @@ impl SendHalf {
     /// (after waiting for the flow-control window).
     pub async fn send(&self, payload: Bytes) -> Result<(), StreamError> {
         let stream_id = self.stream_id;
-        self.rt(move |done| Command::Send { stream_id, payload, done }).await
+        self.rt(move |done| Command::Send {
+            stream_id,
+            payload,
+            done,
+        })
+        .await
     }
 
     /// Initial response metadata. Accepting side only.
@@ -129,24 +137,35 @@ impl SendHalf {
             return Err(StreamError::Connection("opener cannot send HEADERS".into()));
         }
         self.cmd_tx
-            .send(Command::SendHeaders { stream_id: self.stream_id, metadata })
+            .send(Command::SendHeaders {
+                stream_id: self.stream_id,
+                metadata,
+            })
             .map_err(|_| StreamError::Connection("closed".into()))
     }
 
     /// "I'm done sending" (opener side).
     pub async fn half_close(self) -> Result<(), StreamError> {
         let stream_id = self.stream_id;
-        self.rt(move |done| Command::HalfClose { stream_id, done }).await
+        self.rt(move |done| Command::HalfClose { stream_id, done })
+            .await
     }
 
     /// Terminal Status (accepting side).
     pub async fn finish(self, status: Status) -> Result<(), StreamError> {
         let stream_id = self.stream_id;
-        self.rt(move |done| Command::Finish { stream_id, status, done }).await
+        self.rt(move |done| Command::Finish {
+            stream_id,
+            status,
+            done,
+        })
+        .await
     }
 
     pub fn cancel(self) {
-        let _ = self.cmd_tx.send(Command::Cancel { stream_id: self.stream_id });
+        let _ = self.cmd_tx.send(Command::Cancel {
+            stream_id: self.stream_id,
+        });
     }
 }
 
@@ -192,18 +211,31 @@ impl Drop for RecvHalf {
         if self.cancel_on_drop && !self.saw_terminal {
             // stream dropped without a terminal — cancel; the actor silently
             // ignores already-closed streams (reset_ids)
-            let _ = self.cmd_tx.send(Command::Cancel { stream_id: self.stream_id });
+            let _ = self.cmd_tx.send(Command::Cancel {
+                stream_id: self.stream_id,
+            });
         }
     }
 }
 
 #[derive(Clone)]
 pub struct Connection {
+    id: u64,
     cmd_tx: mpsc::UnboundedSender<Command>,
     accept_rx: Arc<Mutex<mpsc::UnboundedReceiver<Incoming>>>,
 }
 
+#[derive(Clone)]
+pub struct WeakConnection {
+    id: u64,
+    cmd_tx: mpsc::WeakUnboundedSender<Command>,
+}
+
 impl Connection {
+    pub fn id(&self) -> u64 {
+        self.id
+    }
+
     pub async fn ping(&self) -> Result<(), String> {
         let (done, wait) = oneshot::channel();
         self.cmd_tx
@@ -220,9 +252,14 @@ impl Connection {
     ) -> Result<(SendHalf, RecvHalf), OpenError> {
         let (reply, wait) = oneshot::channel();
         self.cmd_tx
-            .send(Command::Open { method, metadata, reply })
+            .send(Command::Open {
+                method,
+                metadata,
+                reply,
+            })
             .map_err(|_| OpenError::Connection("closed".into()))?;
-        wait.await.map_err(|_| OpenError::Connection("closed".into()))?
+        wait.await
+            .map_err(|_| OpenError::Connection("closed".into()))?
     }
 
     /// Accept an incoming stream; `None` — connection closed.
@@ -235,13 +272,56 @@ impl Connection {
         self.cmd_tx.is_closed()
     }
 
+    /// Weak handle that does not keep the connection driver alive.
+    pub fn downgrade(&self) -> WeakConnection {
+        WeakConnection {
+            id: self.id,
+            cmd_tx: self.cmd_tx.downgrade(),
+        }
+    }
+
     /// Graceful shutdown: no new streams open, active ones run to completion.
     pub fn go_away(&self, code: GoAwayCode) {
         let _ = self.cmd_tx.send(Command::GoAway { code });
     }
+
+    /// Close the connection immediately. Active streams are cancelled by
+    /// transport teardown; use [`Self::go_away`] for graceful drain.
+    pub fn close(&self) {
+        let _ = self.cmd_tx.send(Command::Close);
+    }
+}
+
+impl WeakConnection {
+    pub fn id(&self) -> u64 {
+        self.id
+    }
+
+    pub async fn ping(&self) -> Result<(), String> {
+        let Some(cmd_tx) = self.cmd_tx.upgrade() else {
+            return Err("connection closed".to_owned());
+        };
+        let (done, wait) = oneshot::channel();
+        cmd_tx
+            .send(Command::Ping { done })
+            .map_err(|_| "connection closed".to_owned())?;
+        wait.await.map_err(|_| "connection closed".to_owned())
+    }
+
+    /// The driver is dead or no strong connection handles remain.
+    pub fn is_closed(&self) -> bool {
+        self.cmd_tx.upgrade().is_none()
+    }
+
+    pub fn close(&self) {
+        if let Some(cmd_tx) = self.cmd_tx.upgrade() {
+            let _ = cmd_tx.send(Command::Close);
+        }
+    }
 }
 
 pub struct ConnectionDriver<T> {
+    connection_id: u64,
     side: Side,
     config: Config,
     /// Some = handshake already done externally (session layer), don't send Hello.
@@ -286,15 +366,18 @@ fn bind_inner<T>(
 where
     T: Stream<Item = Frame> + Sink<Frame, Error = TransportClosed> + Unpin + Send,
 {
+    let connection_id = NEXT_CONNECTION_ID.fetch_add(1, Ordering::Relaxed);
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
     let (accept_tx, accept_rx) = mpsc::unbounded_channel();
     let weak = cmd_tx.downgrade();
     (
         Connection {
+            id: connection_id,
             cmd_tx,
             accept_rx: Arc::new(Mutex::new(accept_rx)),
         },
         ConnectionDriver {
+            connection_id,
             side,
             config,
             pre_negotiated,
@@ -311,10 +394,20 @@ where
     T: Stream<Item = Frame> + Sink<Frame, Error = TransportClosed> + Unpin + Send,
 {
     pub async fn run(mut self) -> Result<(), ConnError> {
+        tracing::debug!(
+            connection_id = self.connection_id,
+            side = ?self.side,
+            "slozhn connection driver starting"
+        );
         // 1. Hello both ways (unless the session layer did the handshake)
         let peer_hello = match self.pre_negotiated.take() {
             Some(h) => h,
             None => {
+                tracing::trace!(
+                    connection_id = self.connection_id,
+                    side = ?self.side,
+                    "sending connection hello"
+                );
                 self.transport
                     .send(conn_frame(frame::Kind::Hello(Hello {
                         version: PROTOCOL_VERSION,
@@ -329,20 +422,56 @@ where
                     Some(frame::Kind::Hello(h)) => h,
                     _ => return Err(ProtocolError::ExpectedHello.into()),
                 };
+                tracing::debug!(
+                    connection_id = self.connection_id,
+                    side = ?self.side,
+                    version = h.version,
+                    initial_stream_window = h.initial_stream_window,
+                    initial_connection_window = h.initial_connection_window,
+                    "received connection hello",
+                );
                 if h.version != PROTOCOL_VERSION {
+                    tracing::warn!(
+                        connection_id = self.connection_id,
+                        side = ?self.side,
+                        peer_version = h.version,
+                        expected_version = PROTOCOL_VERSION,
+                        "connection protocol version mismatch",
+                    );
                     return Err(ProtocolError::VersionMismatch(h.version).into());
                 }
                 h
             }
         };
-        let mut actor =
-            Actor::new(self.side, &self.config, peer_hello, self.cmd_tx, self.accept_tx);
+        let mut actor = Actor::new(
+            self.side,
+            self.connection_id,
+            &self.config,
+            peer_hello,
+            self.cmd_tx,
+            self.accept_tx,
+        );
 
         // 2. main loop
         loop {
             tokio::select! {
                 cmd = self.cmd_rx.recv() => match cmd {
-                    None => return Ok(()), // all handles dropped
+                    None => {
+                        tracing::debug!(
+                            connection_id = actor.connection_id,
+                            side = ?actor.side,
+                            "connection driver stopping: all handles dropped"
+                        );
+                        return Ok(());
+                    }
+                    Some(Command::Close) => {
+                        tracing::warn!(
+                            connection_id = actor.connection_id,
+                            side = ?actor.side,
+                            "connection driver closing by command"
+                        );
+                        return Ok(());
+                    }
                     Some(cmd) => {
                         for out in actor.on_command(cmd) {
                             self.transport.send(out).await?;
@@ -350,7 +479,14 @@ where
                     }
                 },
                 frame = self.transport.next() => match frame {
-                    None => return Err(TransportClosed.into()),
+                    None => {
+                        tracing::debug!(
+                            connection_id = actor.connection_id,
+                            side = ?actor.side,
+                            "connection transport closed"
+                        );
+                        return Err(TransportClosed.into());
+                    }
                     Some(frame) => {
                         match actor.on_frame(frame) {
                             Ok(out) => {
@@ -360,6 +496,13 @@ where
                             }
                             Err(e) => {
                                 // protocol violation: best-effort GoAway, then bail
+                                tracing::warn!(
+                                    connection_id = actor.connection_id,
+                                    side = ?actor.side,
+                                    error = %e,
+                                    highest_remote_open = actor.highest_remote_open,
+                                    "connection protocol violation",
+                                );
                                 let _ = self
                                     .transport
                                     .send(conn_frame(frame::Kind::GoAway(GoAway {
@@ -379,11 +522,19 @@ where
 }
 
 fn conn_frame(kind: frame::Kind) -> Frame {
-    Frame { stream_id: 0, seq: 0, kind: Some(kind) }
+    Frame {
+        stream_id: 0,
+        seq: 0,
+        kind: Some(kind),
+    }
 }
 
 fn stream_frame(stream_id: u64, kind: frame::Kind) -> Frame {
-    Frame { stream_id, seq: 0, kind: Some(kind) }
+    Frame {
+        stream_id,
+        seq: 0,
+        kind: Some(kind),
+    }
 }
 
 struct StreamSlot {
@@ -397,6 +548,7 @@ struct StreamSlot {
 /// An error = protocol violation → the driver bails.
 struct Actor {
     side: Side,
+    connection_id: u64,
     ids: StreamIdAllocator,
     cmd_tx: mpsc::WeakUnboundedSender<Command>,
     /// None after drop (peer GoAway + all streams closed) — accept() → None.
@@ -426,6 +578,7 @@ struct Actor {
 impl Actor {
     fn new(
         side: Side,
+        connection_id: u64,
         config: &Config,
         peer_hello: Hello,
         cmd_tx: mpsc::WeakUnboundedSender<Command>,
@@ -433,6 +586,7 @@ impl Actor {
     ) -> Self {
         Self {
             side,
+            connection_id,
             ids: StreamIdAllocator::new(side),
             cmd_tx,
             accept_tx: Some(accept_tx),
@@ -462,6 +616,13 @@ impl Actor {
                 self.reset_ids.remove(&old);
             }
         }
+        self.close_accept_if_drained();
+    }
+
+    fn close_accept_if_drained(&mut self) {
+        if (self.going_away_local || self.going_away_remote) && self.streams.is_empty() {
+            self.accept_tx = None;
+        }
     }
 
     fn on_command(&mut self, cmd: Command) -> Vec<Frame> {
@@ -470,10 +631,28 @@ impl Actor {
                 let opaque = self.next_ping;
                 self.next_ping += 1;
                 self.pending_pings.insert(opaque, done);
+                tracing::trace!(
+                    connection_id = self.connection_id,
+                    side = ?self.side,
+                    opaque,
+                    "sending ping"
+                );
                 vec![conn_frame(frame::Kind::Ping(Ping { opaque }))]
             }
-            Command::Open { method, metadata, reply } => {
+            Command::Open {
+                method,
+                metadata,
+                reply,
+            } => {
                 if self.going_away_local || self.going_away_remote {
+                    tracing::debug!(
+                        connection_id = self.connection_id,
+                        side = ?self.side,
+                        method,
+                        going_away_local = self.going_away_local,
+                        going_away_remote = self.going_away_remote,
+                        "rejecting open on going-away connection",
+                    );
                     let _ = reply.send(Err(OpenError::GoingAway));
                     return vec![];
                 }
@@ -483,6 +662,13 @@ impl Actor {
                 };
                 let stream_id = self.ids.next_id();
                 let (events_tx, events_rx) = mpsc::unbounded_channel();
+                tracing::debug!(
+                    connection_id = self.connection_id,
+                    side = ?self.side,
+                    stream_id,
+                    method,
+                    "opening stream"
+                );
                 self.streams.insert(
                     stream_id,
                     StreamSlot {
@@ -496,15 +682,32 @@ impl Actor {
                     },
                 );
                 let _ = reply.send(Ok((
-                    SendHalf { stream_id, is_opener: true, cmd_tx: cmd_tx.clone() },
-                    RecvHalf { stream_id, events: events_rx, cmd_tx, saw_terminal: false, cancel_on_drop: true },
+                    SendHalf {
+                        stream_id,
+                        is_opener: true,
+                        cmd_tx: cmd_tx.clone(),
+                    },
+                    RecvHalf {
+                        stream_id,
+                        events: events_rx,
+                        cmd_tx,
+                        saw_terminal: false,
+                        cancel_on_drop: true,
+                    },
                 )));
                 vec![stream_frame(
                     stream_id,
-                    frame::Kind::Open(Open { method, metadata: Some(metadata) }),
+                    frame::Kind::Open(Open {
+                        method,
+                        metadata: Some(metadata),
+                    }),
                 )]
             }
-            Command::Send { stream_id, payload, done } => {
+            Command::Send {
+                stream_id,
+                payload,
+                done,
+            } => {
                 let Some(slot) = self.streams.get_mut(&stream_id) else {
                     let _ = done.send(Err(StreamError::Cancelled));
                     return vec![];
@@ -527,14 +730,20 @@ impl Actor {
                     let _ = done.send(Ok(()));
                     vec![stream_frame(
                         stream_id,
-                        frame::Kind::Message(Message { payload, compressed: false }),
+                        frame::Kind::Message(Message {
+                            payload,
+                            compressed: false,
+                        }),
                     )]
                 } else {
                     slot.blocked.push_back((payload, done));
                     vec![]
                 }
             }
-            Command::SendHeaders { stream_id, metadata } => {
+            Command::SendHeaders {
+                stream_id,
+                metadata,
+            } => {
                 if self
                     .streams
                     .get(&stream_id)
@@ -542,7 +751,9 @@ impl Actor {
                 {
                     vec![stream_frame(
                         stream_id,
-                        frame::Kind::Headers(Headers { metadata: Some(metadata) }),
+                        frame::Kind::Headers(Headers {
+                            metadata: Some(metadata),
+                        }),
                     )]
                 } else {
                     vec![]
@@ -564,9 +775,16 @@ impl Actor {
                 if closed {
                     self.remove_slot(stream_id);
                 }
-                vec![stream_frame(stream_id, frame::Kind::HalfClose(HalfClose {}))]
+                vec![stream_frame(
+                    stream_id,
+                    frame::Kind::HalfClose(HalfClose {}),
+                )]
             }
-            Command::Finish { stream_id, status, done } => {
+            Command::Finish {
+                stream_id,
+                status,
+                done,
+            } => {
                 let Some(slot) = self.streams.get_mut(&stream_id) else {
                     let _ = done.send(Err(StreamError::Cancelled));
                     return vec![];
@@ -586,7 +804,10 @@ impl Actor {
                 slot.state.local_terminate();
                 let _ = slot.events.send(StreamEvent::Cancelled);
                 self.remove_slot(stream_id);
-                vec![stream_frame(stream_id, frame::Kind::Cancel(crate::proto::v1::Cancel {}))]
+                vec![stream_frame(
+                    stream_id,
+                    frame::Kind::Cancel(crate::proto::v1::Cancel {}),
+                )]
             }
             Command::Credit { stream_id, bytes } => {
                 let mut out = Vec::new();
@@ -609,12 +830,22 @@ impl Actor {
             }
             Command::GoAway { code } => {
                 self.going_away_local = true;
+                tracing::info!(
+                    connection_id = self.connection_id,
+                    side = ?self.side,
+                    code = ?code,
+                    last_stream_id = self.highest_remote_open,
+                    active_streams = self.streams.len(),
+                    "sending goaway",
+                );
+                self.close_accept_if_drained();
                 vec![conn_frame(frame::Kind::GoAway(GoAway {
                     last_stream_id: self.highest_remote_open,
                     code: code as u32,
                     message: String::new(),
                 }))]
             }
+            Command::Close => vec![],
         }
     }
 
@@ -634,9 +865,8 @@ impl Actor {
             }
             frame::Kind::Message(msg) => {
                 let len = msg.payload.len() as u32;
-                let delivered = self.stream_event(stream_id, |slot| {
-                    slot.state.on_message(stream_id, msg)
-                })?;
+                let delivered =
+                    self.stream_event(stream_id, |slot| slot.state.on_message(stream_id, msg))?;
                 if !delivered {
                     // message discarded (terminal/race) — refund the connection credit
                     return Ok(self.refund_conn_credit(len));
@@ -646,7 +876,11 @@ impl Actor {
             frame::Kind::HalfClose(_) => {
                 let out = self.stream_event(stream_id, |slot| slot.state.on_half_close())?;
                 let _ = out;
-                if self.streams.get(&stream_id).is_some_and(|s| s.state.is_closed()) {
+                if self
+                    .streams
+                    .get(&stream_id)
+                    .is_some_and(|s| s.state.is_closed())
+                {
                     self.remove_slot(stream_id);
                 }
                 Ok(vec![])
@@ -694,9 +928,23 @@ impl Actor {
     fn on_conn_frame(&mut self, kind: frame::Kind) -> Result<Vec<Frame>, ProtocolError> {
         match kind {
             frame::Kind::Ping(p) => {
-                Ok(vec![conn_frame(frame::Kind::Pong(Pong { opaque: p.opaque }))])
+                tracing::trace!(
+                    connection_id = self.connection_id,
+                    side = ?self.side,
+                    opaque = p.opaque,
+                    "received ping"
+                );
+                Ok(vec![conn_frame(frame::Kind::Pong(Pong {
+                    opaque: p.opaque,
+                }))])
             }
             frame::Kind::Pong(p) => {
+                tracing::trace!(
+                    connection_id = self.connection_id,
+                    side = ?self.side,
+                    opaque = p.opaque,
+                    "received pong"
+                );
                 if let Some(done) = self.pending_pings.remove(&p.opaque) {
                     let _ = done.send(());
                 }
@@ -709,6 +957,16 @@ impl Actor {
             frame::Kind::Hello(_) => Err(ProtocolError::ExpectedHello), // a second Hello is forbidden
             frame::Kind::GoAway(ga) => {
                 self.going_away_remote = true;
+                let code = GoAwayCode::from_u32(ga.code);
+                tracing::info!(
+                    connection_id = self.connection_id,
+                    side = ?self.side,
+                    code = ?code,
+                    last_stream_id = ga.last_stream_id,
+                    message = %ga.message,
+                    active_streams = self.streams.len(),
+                    "received goaway",
+                );
                 // streams the peer will no longer accept — fail their pending sends
                 let last = ga.last_stream_id;
                 for (&id, slot) in self.streams.iter_mut() {
@@ -716,9 +974,7 @@ impl Actor {
                         Self::fail_blocked(slot);
                     }
                 }
-                if self.streams.is_empty() {
-                    self.accept_tx = None;
-                }
+                self.close_accept_if_drained();
                 Ok(vec![])
             }
             frame::Kind::Ack(_) => Ok(vec![]), // session layer; phase 1 ignores it
@@ -735,13 +991,29 @@ impl Actor {
         }
         if self.going_away_local {
             // we're going away — reject the peer's new streams (it hasn't seen GoAway yet)
-            return Ok(vec![stream_frame(stream_id, frame::Kind::Cancel(crate::proto::v1::Cancel {}))]);
+            tracing::debug!(
+                connection_id = self.connection_id,
+                side = ?self.side,
+                stream_id,
+                "rejecting peer open during local goaway"
+            );
+            return Ok(vec![stream_frame(
+                stream_id,
+                frame::Kind::Cancel(crate::proto::v1::Cancel {}),
+            )]);
         }
         self.highest_remote_open = self.highest_remote_open.max(stream_id);
         let Some(cmd_tx) = self.cmd_tx.upgrade() else {
             return Ok(vec![]); // all handles dropped — connection is dying
         };
         let (events_tx, events_rx) = mpsc::unbounded_channel();
+        tracing::debug!(
+            connection_id = self.connection_id,
+            side = ?self.side,
+            stream_id,
+            method = %open.method,
+            "accepted peer stream",
+        );
         self.streams.insert(
             stream_id,
             StreamSlot {
@@ -754,8 +1026,18 @@ impl Actor {
             let _ = accept_tx.send(Incoming {
                 method: open.method,
                 metadata: open.metadata.unwrap_or_default(),
-                send: SendHalf { stream_id, is_opener: false, cmd_tx: cmd_tx.clone() },
-                recv: RecvHalf { stream_id, events: events_rx, cmd_tx, saw_terminal: false, cancel_on_drop: false },
+                send: SendHalf {
+                    stream_id,
+                    is_opener: false,
+                    cmd_tx: cmd_tx.clone(),
+                },
+                recv: RecvHalf {
+                    stream_id,
+                    events: events_rx,
+                    cmd_tx,
+                    saw_terminal: false,
+                    cancel_on_drop: false,
+                },
             });
         }
         Ok(vec![])
@@ -791,7 +1073,9 @@ impl Actor {
         if self.conn_recv_credit >= self.local_conn_window / 2 {
             let inc = self.conn_recv_credit;
             self.conn_recv_credit = 0;
-            vec![conn_frame(frame::Kind::WindowUpdate(WindowUpdate { increment: inc }))]
+            vec![conn_frame(frame::Kind::WindowUpdate(WindowUpdate {
+                increment: inc,
+            }))]
         } else {
             vec![]
         }
@@ -812,7 +1096,9 @@ impl Actor {
             None => self.streams.keys().copied().collect(),
         };
         for id in ids {
-            let Some(slot) = self.streams.get_mut(&id) else { continue };
+            let Some(slot) = self.streams.get_mut(&id) else {
+                continue;
+            };
             while let Some((payload, _)) = slot.blocked.front() {
                 if slot.state.can_send() && self.conn_send_window.can_send() {
                     let len = payload.len();
@@ -822,7 +1108,10 @@ impl Actor {
                     let _ = done.send(Ok(()));
                     out.push(stream_frame(
                         id,
-                        frame::Kind::Message(Message { payload, compressed: false }),
+                        frame::Kind::Message(Message {
+                            payload,
+                            compressed: false,
+                        }),
                     ));
                 } else {
                     break;

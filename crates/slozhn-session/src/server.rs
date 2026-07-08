@@ -3,6 +3,7 @@
 //! tokio TTL). Behind a load balancer, sticky sessions are required (spec §8).
 
 use std::collections::{HashMap, VecDeque};
+use std::fmt::Write as _;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
@@ -10,12 +11,12 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use futures::{Future, Sink, SinkExt, Stream, StreamExt};
-use slozhn_frame::proto::v1::{frame, Frame, Hello};
 use slozhn_frame::TransportClosed;
+use slozhn_frame::proto::v1::{Frame, Hello, frame};
 use tokio::sync::mpsc;
 
 use crate::client::{BoxFrameTransport, FrameDuplex};
-use crate::core::{sessioned, Ingress, SessionCore};
+use crate::core::{Ingress, SessionCore, sessioned};
 use crate::{SessionConfig, SessionError};
 
 #[derive(Clone)]
@@ -43,6 +44,14 @@ struct SessionEntry {
 
 type Registry = Arc<Mutex<HashMap<Bytes, SessionEntry>>>;
 
+fn session_label(session_id: &Bytes) -> String {
+    let mut out = String::with_capacity(16);
+    for b in session_id.iter().take(8) {
+        let _ = write!(&mut out, "{b:02x}");
+    }
+    out
+}
+
 pub struct SessionManager {
     sessions: Registry,
     config: ServerSessionConfig,
@@ -50,7 +59,10 @@ pub struct SessionManager {
 
 impl SessionManager {
     pub fn new(config: ServerSessionConfig) -> Arc<Self> {
-        Arc::new(Self { sessions: Arc::new(Mutex::new(HashMap::new())), config })
+        Arc::new(Self {
+            sessions: Arc::new(Mutex::new(HashMap::new())),
+            config,
+        })
     }
 
     /// Handle a new physical connection.
@@ -60,15 +72,23 @@ impl SessionManager {
         &self,
         mut transport: BoxFrameTransport,
     ) -> Result<Option<(ServerSessionTransport, Hello)>, SessionError> {
-        let first = transport
-            .next()
-            .await
-            .ok_or_else(|| SessionError::Handshake("closed before hello".into()))?;
+        let first = transport.next().await.ok_or_else(|| {
+            tracing::warn!("server session transport closed before hello");
+            SessionError::Handshake("closed before hello".into())
+        })?;
         let hello = match first.kind {
             Some(frame::Kind::Hello(h)) => h,
-            _ => return Err(SessionError::Handshake("expected hello".into())),
+            _ => {
+                tracing::warn!("server session accept received non-hello frame");
+                return Err(SessionError::Handshake("expected hello".into()));
+            }
         };
         if hello.version != slozhn_frame::PROTOCOL_VERSION {
+            tracing::warn!(
+                peer_version = hello.version,
+                expected_version = slozhn_frame::PROTOCOL_VERSION,
+                "server session protocol version mismatch",
+            );
             return Err(SessionError::Handshake(format!(
                 "unsupported version {}",
                 hello.version
@@ -78,18 +98,27 @@ impl SessionManager {
         if hello.session_id.is_empty() {
             // new session
             let session_id = Bytes::copy_from_slice(uuid::Uuid::new_v4().as_bytes());
+            let session_log_id = session_label(&session_id);
             let token = Bytes::copy_from_slice(uuid::Uuid::new_v4().as_bytes());
             let reply = server_hello(&self.config.frame, &session_id, &token, 0, false);
-            transport
-                .send(reply)
-                .await
-                .map_err(|_| SessionError::Handshake("closed during hello reply".into()))?;
+            transport.send(reply).await.map_err(|_| {
+                tracing::warn!("server session transport closed during hello reply");
+                SessionError::Handshake("closed during hello reply".into())
+            })?;
 
             let (attach_tx, attach_rx) = mpsc::unbounded_channel();
-            self.sessions
-                .lock()
-                .expect("registry lock")
-                .insert(session_id.clone(), SessionEntry { token: token.clone(), attach_tx });
+            self.sessions.lock().expect("registry lock").insert(
+                session_id.clone(),
+                SessionEntry {
+                    token: token.clone(),
+                    attach_tx,
+                },
+            );
+            tracing::info!(
+                session_id = %session_log_id,
+                ttl_ms = self.config.ttl.as_millis(),
+                "server session created",
+            );
 
             let st = ServerSessionTransport {
                 phase: SPhase::Active(transport),
@@ -104,6 +133,7 @@ impl SessionManager {
                 attach_closed: false,
                 frame_config: self.config.frame.clone(),
                 session_id,
+                session_log_id,
                 token,
                 ttl: self.config.ttl,
                 registry: self.sessions.clone(),
@@ -113,6 +143,7 @@ impl SessionManager {
 
         // resume
         let session_id = hello.session_id.clone();
+        let session_log_id = session_label(&session_id);
         let mut transport = Some(transport);
         {
             let sessions = self.sessions.lock().expect("registry lock");
@@ -122,16 +153,39 @@ impl SessionManager {
                 let t = transport.take().expect("present");
                 match entry.attach_tx.send((t, hello.last_recv_seq)) {
                     // the ServerSessionTransport itself will send the Hello reply + replay
-                    Ok(()) => return Ok(None),
+                    Ok(()) => {
+                        tracing::info!(
+                            session_id = %session_log_id,
+                            client_last_recv_seq = hello.last_recv_seq,
+                            "server session resume handed off",
+                        );
+                        return Ok(None);
+                    }
                     // session died between lookup and send — take the transport back
-                    Err(mpsc::error::SendError((t, _))) => transport = Some(t),
+                    Err(mpsc::error::SendError((t, _))) => {
+                        tracing::warn!(
+                            session_id = %session_log_id,
+                            "server session resume target died during handoff",
+                        );
+                        transport = Some(t);
+                    }
                 }
             }
         }
         // no session / wrong token / session died — honest rejection
+        tracing::warn!(
+            session_id = %session_log_id,
+            "server session resume rejected",
+        );
         if let Some(mut t) = transport {
             let _ = t
-                .send(server_hello(&self.config.frame, &Bytes::new(), &Bytes::new(), 0, true))
+                .send(server_hello(
+                    &self.config.frame,
+                    &Bytes::new(),
+                    &Bytes::new(),
+                    0,
+                    true,
+                ))
                 .await;
         }
         Ok(None)
@@ -177,6 +231,7 @@ pub struct ServerSessionTransport {
     attach_closed: bool,
     frame_config: slozhn_frame::connection::Config,
     session_id: Bytes,
+    session_log_id: String,
     token: Bytes,
     ttl: Duration,
     registry: Registry,
@@ -204,12 +259,22 @@ impl ServerSessionTransport {
     }
 
     fn detach(&mut self) {
+        tracing::debug!(
+            session_id = %self.session_log_id,
+            pending_out = self.pending_out.len(),
+            ttl_ms = self.ttl.as_millis(),
+            "server session detached from physical transport",
+        );
         self.pending_out.clear();
         self.ack_timer = None;
         self.phase = SPhase::Detached(Box::pin(tokio::time::sleep(self.ttl)));
     }
 
     fn die(&mut self) {
+        tracing::info!(
+            session_id = %self.session_log_id,
+            "server session expired or closed",
+        );
         self.registry
             .lock()
             .expect("registry lock")
@@ -228,6 +293,13 @@ impl ServerSessionTransport {
             false,
         ));
         let replay = self.core.replay_after(client_last_recv);
+        tracing::info!(
+            session_id = %self.session_log_id,
+            client_last_recv_seq = client_last_recv,
+            server_last_recv_seq = self.core.last_recv_seq(),
+            replay_frames = replay.len(),
+            "server session attached to resumed transport",
+        );
         self.pending_out.extend(replay);
         self.phase = SPhase::Active(t);
     }
@@ -339,6 +411,10 @@ impl Sink<Frame> for ServerSessionTransport {
                 Ok(())
             }
             Err(_) => {
+                tracing::warn!(
+                    session_id = %this.session_log_id,
+                    "server session replay buffer overflow; closing session",
+                );
                 this.die();
                 Err(TransportClosed)
             }

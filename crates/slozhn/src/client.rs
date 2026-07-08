@@ -3,8 +3,10 @@
 
 use std::sync::Arc;
 
-use slozhn_client::reconnect::{AutoChannel, AutoConfig, FactoryOutput, TransportFactory};
 use slozhn_client::Spawner;
+use slozhn_client::reconnect::{
+    AutoChannel, AutoConfig, FactoryOutput, KeepaliveConfig, TransportFactory,
+};
 use slozhn_session::SessionConfig;
 
 /// Channel for tonic clients: `EchoClient::new(channel)`.
@@ -16,6 +18,7 @@ pub fn builder(url: impl Into<String>) -> ChannelBuilder {
         resume: None,
         resume_explicit: false,
         reconnect: AutoConfig::default(),
+        keepalive: Some(KeepaliveConfig::default()),
         frame: slozhn_frame::connection::Config::default(),
         headers: http::HeaderMap::new(),
     }
@@ -26,6 +29,7 @@ pub struct ChannelBuilder {
     resume: Option<SessionConfig>,
     resume_explicit: bool,
     reconnect: AutoConfig,
+    keepalive: Option<KeepaliveConfig>,
     frame: slozhn_frame::connection::Config,
     headers: http::HeaderMap,
 }
@@ -48,6 +52,15 @@ impl ChannelBuilder {
 
     pub fn reconnect_config(mut self, cfg: AutoConfig) -> Self {
         self.reconnect = cfg;
+        self
+    }
+
+    /// Configure raw-connection keepalive. `None` disables automatic pings.
+    ///
+    /// Session channels do not use logical keepalive pings during reconnect
+    /// gaps; the session transport owns physical reconnect.
+    pub fn keepalive_config(mut self, cfg: Option<KeepaliveConfig>) -> Self {
+        self.keepalive = cfg;
         self
     }
 
@@ -75,7 +88,15 @@ impl ChannelBuilder {
             "browser WebSocket cannot set headers; use query params or cookies"
         );
 
-        let Self { url, mut resume, resume_explicit, reconnect, frame, headers } = self;
+        let Self {
+            url,
+            mut resume,
+            resume_explicit,
+            reconnect,
+            keepalive,
+            frame,
+            headers,
+        } = self;
         // .resume() (без явного конфига) наследует бэкофф из reconnect_config,
         // независимо от порядка вызовов билдера
         if let Some(cfg) = &mut resume
@@ -111,7 +132,10 @@ impl ChannelBuilder {
                             })
                         };
                         let (t, peer_hello) = slozhn_session::client::connect_session_hooked(
-                            ws_factory, frame, session_cfg, session_hooks.clone(),
+                            ws_factory,
+                            frame,
+                            session_cfg,
+                            session_hooks.clone(),
                         )
                         .await
                         .map_err(|e| e.to_string())?;
@@ -120,7 +144,14 @@ impl ChannelBuilder {
                 }
             })
         });
-        AutoChannel::with_hooks(factory, default_spawner(), reconnect, hooks, state_rx)
+        AutoChannel::with_hooks_and_keepalive(
+            factory,
+            default_spawner(),
+            reconnect,
+            hooks,
+            state_rx,
+            keepalive,
+        )
     }
 }
 
@@ -128,9 +159,14 @@ async fn raw_transport(
     url: &str,
     headers: &http::HeaderMap,
 ) -> Result<slozhn_frame::transport::BoxFrameTransport, String> {
-    let ws = slozhn_ws::connect(url, slozhn_ws::WsConfig { headers: headers.clone() })
-        .await
-        .map_err(|e| e.to_string())?;
+    let ws = slozhn_ws::connect(
+        url,
+        slozhn_ws::WsConfig {
+            headers: headers.clone(),
+        },
+    )
+    .await
+    .map_err(|e| e.to_string())?;
     Ok(Box::pin(slozhn_frame::codec::framed(ws)))
 }
 

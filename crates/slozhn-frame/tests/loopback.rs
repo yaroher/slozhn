@@ -1,4 +1,4 @@
-use slozhn_frame::connection::{bind, Config};
+use slozhn_frame::connection::{Config, bind};
 use slozhn_frame::ids::Side;
 use slozhn_frame::loopback;
 
@@ -63,7 +63,10 @@ async fn unary_echo() {
     send.send(Bytes::from_static(b"hello")).await.unwrap();
     send.half_close().await.unwrap();
 
-    assert!(matches!(recv.next_event().await, Some(StreamEvent::Headers(_))));
+    assert!(matches!(
+        recv.next_event().await,
+        Some(StreamEvent::Headers(_))
+    ));
     assert!(matches!(
         recv.next_event().await,
         Some(StreamEvent::Message(b)) if b.as_ref() == b"hello"
@@ -117,7 +120,10 @@ async fn server_streaming() {
     send.send(Bytes::from_static(b"req")).await.unwrap();
     send.half_close().await.unwrap();
 
-    assert!(matches!(recv.next_event().await, Some(StreamEvent::Headers(_))));
+    assert!(matches!(
+        recv.next_event().await,
+        Some(StreamEvent::Headers(_))
+    ));
     for i in 0u8..5 {
         assert!(matches!(
             recv.next_event().await,
@@ -175,7 +181,10 @@ async fn client_streaming() {
     }
     send.half_close().await.unwrap();
 
-    assert!(matches!(recv.next_event().await, Some(StreamEvent::Headers(_))));
+    assert!(matches!(
+        recv.next_event().await,
+        Some(StreamEvent::Headers(_))
+    ));
     let sum = match recv.next_event().await {
         Some(StreamEvent::Message(b)) => u64::from_le_bytes(b.as_ref().try_into().unwrap()),
         other => panic!("unexpected {other:?}"),
@@ -229,11 +238,16 @@ async fn bidi_interleaved() {
         .await
         .unwrap();
 
-    assert!(matches!(recv.next_event().await, Some(StreamEvent::Headers(_))));
+    assert!(matches!(
+        recv.next_event().await,
+        Some(StreamEvent::Headers(_))
+    ));
     // strict interleaving: the reply to i arrives BEFORE i+1 is sent —
     // catches ordering bugs
     for i in 1u64..=20 {
-        send.send(Bytes::copy_from_slice(&i.to_le_bytes())).await.unwrap();
+        send.send(Bytes::copy_from_slice(&i.to_le_bytes()))
+            .await
+            .unwrap();
         match recv.next_event().await {
             Some(StreamEvent::Message(b)) => {
                 assert_eq!(u64::from_le_bytes(b.as_ref().try_into().unwrap()), i * 2);
@@ -283,7 +297,7 @@ async fn cancel_reaches_peer() {
 #[tokio::test]
 async fn protocol_violation_goaway() {
     use futures::{SinkExt, StreamExt};
-    use slozhn_frame::proto::v1::{frame, Frame, Hello, Message};
+    use slozhn_frame::proto::v1::{Frame, Hello, Message, frame};
 
     let (a, mut raw) = loopback::pair();
     let (_client, drv) = bind(Side::Client, Config::default(), a);
@@ -356,7 +370,10 @@ async fn goaway_blocks_new_opens() {
 
     // wait until GoAway reaches the client: new opens start getting rejected
     loop {
-        match client.open("/svc.S/AfterGoAway".into(), Metadata::empty()).await {
+        match client
+            .open("/svc.S/AfterGoAway".into(), Metadata::empty())
+            .await
+        {
             Err(OpenError::GoingAway) => break,
             Ok((s, _r)) => {
                 // GoAway still in flight; close the probe stream and retry
@@ -380,11 +397,21 @@ async fn goaway_blocks_new_opens() {
     inc.send.send(payload).await.unwrap();
     inc.send.finish(Status::ok()).await.unwrap();
 
-    assert!(matches!(recv.next_event().await, Some(StreamEvent::Headers(_))));
+    assert!(matches!(
+        recv.next_event().await,
+        Some(StreamEvent::Headers(_))
+    ));
     assert!(matches!(
         recv.next_event().await,
         Some(StreamEvent::Message(b)) if b.as_ref() == b"ping"
     ));
+
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_secs(1), server.accept())
+            .await
+            .expect("goaway should drain accept loop")
+            .is_none()
+    );
 }
 
 #[tokio::test]
@@ -395,7 +422,10 @@ async fn send_blocks_without_window_and_resumes_on_read() {
     use slozhn_frame::stream::StreamEvent;
     use std::time::Duration;
 
-    let cfg = Config { initial_stream_window: 16, initial_connection_window: 1024 };
+    let cfg = Config {
+        initial_stream_window: 16,
+        initial_connection_window: 1024,
+    };
     let (a, b) = loopback::pair();
     let (client, cd) = bind(Side::Client, cfg.clone(), a);
     let (server, sd) = bind(Side::Server, cfg, b);
@@ -440,7 +470,10 @@ async fn connection_window_caps_across_streams() {
     use slozhn_frame::stream::StreamEvent;
     use std::time::Duration;
 
-    let cfg = Config { initial_stream_window: 1024, initial_connection_window: 16 };
+    let cfg = Config {
+        initial_stream_window: 1024,
+        initial_connection_window: 16,
+    };
     let (a, b) = loopback::pair();
     let (client, cd) = bind(Side::Client, cfg.clone(), a);
     let (server, sd) = bind(Side::Server, cfg, b);
@@ -519,10 +552,15 @@ async fn pre_negotiated_bind_works() {
         .open("/echo.Echo/Do".into(), Metadata::empty())
         .await
         .unwrap();
-    send.send(Bytes::from_static(b"pre-negotiated")).await.unwrap();
+    send.send(Bytes::from_static(b"pre-negotiated"))
+        .await
+        .unwrap();
     send.half_close().await.unwrap();
 
-    assert!(matches!(recv.next_event().await, Some(StreamEvent::Headers(_))));
+    assert!(matches!(
+        recv.next_event().await,
+        Some(StreamEvent::Headers(_))
+    ));
     assert!(matches!(
         recv.next_event().await,
         Some(StreamEvent::Message(b)) if b.as_ref() == b"pre-negotiated"
@@ -560,7 +598,7 @@ async fn dropping_recv_half_cancels_stream() {
 #[tokio::test]
 async fn version_mismatch_kills_connection() {
     use futures::{SinkExt, StreamExt};
-    use slozhn_frame::proto::v1::{frame, Frame, Hello};
+    use slozhn_frame::proto::v1::{Frame, Hello, frame};
 
     let (a, mut raw) = loopback::pair();
     let (_client, drv) = bind(Side::Client, Config::default(), a);
@@ -570,7 +608,10 @@ async fn version_mismatch_kills_connection() {
     raw.send(Frame {
         stream_id: 0,
         seq: 0,
-        kind: Some(frame::Kind::Hello(Hello { version: 99, ..Default::default() })),
+        kind: Some(frame::Kind::Hello(Hello {
+            version: 99,
+            ..Default::default()
+        })),
     })
     .await
     .unwrap();

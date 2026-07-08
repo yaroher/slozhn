@@ -33,7 +33,14 @@ where
         match std::task::ready!(Pin::new(&mut self.inner).poll_next(cx)) {
             Some(bytes) => match Frame::decode(bytes.as_ref()) {
                 Ok(frame) => Poll::Ready(Some(frame)),
-                Err(_) => Poll::Ready(None), // broken peer — drop the connection
+                Err(error) => {
+                    tracing::warn!(
+                        len = bytes.len(),
+                        %error,
+                        "failed to decode frame; closing transport",
+                    );
+                    Poll::Ready(None)
+                }
             },
             None => Poll::Ready(None),
         }
@@ -70,7 +77,11 @@ mod tests {
     async fn frame_roundtrip_through_bytes() {
         let (a, mut b) = loopback::byte_pair();
         let mut fa = framed(a);
-        let frame = Frame { stream_id: 7, seq: 0, kind: None };
+        let frame = Frame {
+            stream_id: 7,
+            seq: 0,
+            kind: None,
+        };
         fa.send(frame.clone()).await.unwrap();
         let raw = b.next().await.unwrap();
         assert_eq!(Frame::decode(raw.as_ref()).unwrap(), frame);

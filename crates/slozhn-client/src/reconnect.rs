@@ -7,13 +7,13 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
-use futures::future::BoxFuture;
-use slozhn_frame::connection::{bind, Config};
+use futures::future::{BoxFuture, Either, select};
+use slozhn_frame::connection::{Config, bind};
 use slozhn_frame::ids::Side;
 use slozhn_frame::transport::{ConnState, ReconnectHooks};
-use slozhn_frame::Connection;
+use slozhn_frame::{Connection, WeakConnection};
 
-use crate::{unavailable_response, Channel, ClientError, Spawner};
+use crate::{Channel, ClientError, Spawner, unavailable_response};
 
 #[cfg(not(target_arch = "wasm32"))]
 async fn sleep_backoff(d: Duration) {
@@ -23,6 +23,19 @@ async fn sleep_backoff(d: Duration) {
 #[cfg(target_arch = "wasm32")]
 async fn sleep_backoff(d: Duration) {
     futures_timer::Delay::new(d).await;
+}
+
+async fn timeout_after<T>(
+    d: Duration,
+    future: impl std::future::Future<Output = T>,
+) -> Result<T, ()> {
+    futures::pin_mut!(future);
+    let delay = futures_timer::Delay::new(d);
+    futures::pin_mut!(delay);
+    match select(future, delay).await {
+        Either::Left((output, _)) => Ok(output),
+        Either::Right(((), _)) => Err(()),
+    }
 }
 
 pub use slozhn_frame::transport::{BoxFrameTransport, FrameDuplex};
@@ -52,6 +65,27 @@ impl Default for AutoConfig {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct KeepaliveConfig {
+    /// Raw-connection keepalive cadence.
+    ///
+    /// Session channels do not use this logical ping: a reconnect gap can
+    /// legitimately drop non-session frames, while the session layer keeps
+    /// recovering the logical connection.
+    pub interval: Duration,
+    /// How long to wait for Pong before forcing a raw connection closed.
+    pub timeout: Duration,
+}
+
+impl Default for KeepaliveConfig {
+    fn default() -> Self {
+        Self {
+            interval: Duration::from_secs(30),
+            timeout: Duration::from_secs(10),
+        }
+    }
+}
+
 /// Channel with auto-reconnect. Clone is cheap, state is shared.
 #[derive(Clone)]
 pub struct AutoChannel {
@@ -59,6 +93,7 @@ pub struct AutoChannel {
     factory: TransportFactory,
     spawner: Spawner,
     config: AutoConfig,
+    keepalive: Option<KeepaliveConfig>,
     hooks: ReconnectHooks,
     state_rx: tokio::sync::watch::Receiver<ConnState>,
 }
@@ -83,11 +118,30 @@ impl AutoChannel {
         hooks: ReconnectHooks,
         state_rx: tokio::sync::watch::Receiver<ConnState>,
     ) -> Self {
+        Self::with_hooks_and_keepalive(
+            factory,
+            spawner,
+            config,
+            hooks,
+            state_rx,
+            Some(KeepaliveConfig::default()),
+        )
+    }
+
+    pub fn with_hooks_and_keepalive(
+        factory: TransportFactory,
+        spawner: Spawner,
+        config: AutoConfig,
+        hooks: ReconnectHooks,
+        state_rx: tokio::sync::watch::Receiver<ConnState>,
+        keepalive: Option<KeepaliveConfig>,
+    ) -> Self {
         Self {
             state: Arc::new(tokio::sync::Mutex::new(State { current: None })),
             factory,
             spawner,
             config,
+            keepalive,
             hooks,
             state_rx,
         }
@@ -120,12 +174,20 @@ impl AutoChannel {
             self.hooks.set(ConnState::Connecting);
             match (self.factory)().await {
                 Ok(output) => {
-                    let (conn, driver_fut): (Connection, BoxFuture<'static, ()>) = match output {
+                    let (conn, driver_fut, raw_keepalive): (
+                        Connection,
+                        BoxFuture<'static, ()>,
+                        bool,
+                    ) = match output {
                         FactoryOutput::Raw(t) => {
                             let (conn, driver) = bind(Side::Client, Config::default(), t);
-                            (conn, Box::pin(async move {
-                                let _ = driver.run().await; // disconnect is a normal outcome
-                            }))
+                            (
+                                conn,
+                                Box::pin(async move {
+                                    let _ = driver.run().await; // disconnect is a normal outcome
+                                }),
+                                true,
+                            )
                         }
                         FactoryOutput::PreNegotiated(t, peer_hello) => {
                             let (conn, driver) = slozhn_frame::connection::bind_pre_negotiated(
@@ -134,9 +196,13 @@ impl AutoChannel {
                                 peer_hello,
                                 t,
                             );
-                            (conn, Box::pin(async move {
-                                let _ = driver.run().await;
-                            }))
+                            (
+                                conn,
+                                Box::pin(async move {
+                                    let _ = driver.run().await;
+                                }),
+                                false,
+                            )
                         }
                     };
                     let hooks = self.hooks.clone();
@@ -144,6 +210,13 @@ impl AutoChannel {
                         driver_fut.await;
                         hooks.set(ConnState::Disconnected);
                     }));
+                    if raw_keepalive && let Some(keepalive_config) = self.keepalive {
+                        let hooks = self.hooks.clone();
+                        let conn_for_keepalive = conn.downgrade();
+                        (self.spawner)(Box::pin(async move {
+                            keepalive(conn_for_keepalive, hooks, keepalive_config).await;
+                        }));
+                    }
                     let ch = Channel::new(conn.clone(), self.spawner.clone());
                     state.current = Some((conn, ch.clone()));
                     self.hooks.set(ConnState::Connected);
@@ -160,6 +233,47 @@ impl AutoChannel {
                     }
                     base = (base * 2).min(self.config.max_backoff);
                 }
+            }
+        }
+    }
+}
+
+async fn keepalive(conn: WeakConnection, hooks: ReconnectHooks, config: KeepaliveConfig) {
+    loop {
+        sleep_backoff(config.interval).await;
+        if conn.is_closed() {
+            return;
+        }
+        tracing::trace!(
+            connection_id = conn.id(),
+            interval_ms = config.interval.as_millis(),
+            "sending raw connection keepalive"
+        );
+        match timeout_after(config.timeout, conn.ping()).await {
+            Ok(Ok(())) => {
+                tracing::trace!(
+                    connection_id = conn.id(),
+                    "raw connection keepalive acknowledged"
+                );
+            }
+            Ok(Err(error)) => {
+                tracing::warn!(
+                    connection_id = conn.id(),
+                    %error,
+                    "raw connection keepalive failed"
+                );
+                hooks.set(ConnState::Disconnected);
+                return;
+            }
+            Err(()) => {
+                tracing::warn!(
+                    connection_id = conn.id(),
+                    timeout_ms = config.timeout.as_millis(),
+                    "raw connection keepalive timed out",
+                );
+                conn.close();
+                hooks.set(ConnState::Disconnected);
+                return;
             }
         }
     }
@@ -182,9 +296,7 @@ impl tower::Service<http::Request<tonic::body::Body>> for AutoChannel {
                 Ok(resp) => Ok(resp),
                 // connection died between ensure and open — honest UNAVAILABLE;
                 // no retry on our own: the body may have been partially sent
-                Err(ClientError::Open(_)) | Err(ClientError::Closed) => {
-                    Ok(unavailable_response())
-                }
+                Err(ClientError::Open(_)) | Err(ClientError::Closed) => Ok(unavailable_response()),
             }
         })
     }
@@ -193,6 +305,7 @@ impl tower::Service<http::Request<tonic::body::Body>> for AutoChannel {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::time::Duration;
 
@@ -261,5 +374,64 @@ mod tests {
         .await
         .expect("kick must break the backoff");
         assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn keepalive_does_not_keep_raw_connection_alive() {
+        let (client_transport, server_transport) = slozhn_frame::loopback::pair();
+        let (server, server_driver) =
+            slozhn_frame::connection::bind(Side::Server, Config::default(), server_transport);
+        tokio::spawn(async move {
+            let _ = server_driver.run().await;
+        });
+
+        let transport = Arc::new(Mutex::new(Some(client_transport)));
+        let factory: TransportFactory = Arc::new(move || {
+            let transport = transport.clone();
+            Box::pin(async move {
+                let transport = transport
+                    .lock()
+                    .expect("transport lock")
+                    .take()
+                    .expect("single transport");
+                Ok(FactoryOutput::Raw(Box::pin(transport)))
+            })
+        });
+
+        let (driver_done_tx, mut driver_done_rx) = tokio::sync::mpsc::unbounded_channel();
+        let spawned = Arc::new(AtomicU32::new(0));
+        let spawner: Spawner = Arc::new(move |f| {
+            let idx = spawned.fetch_add(1, Ordering::SeqCst);
+            let driver_done_tx = driver_done_tx.clone();
+            tokio::spawn(async move {
+                f.await;
+                if idx == 0 {
+                    let _ = driver_done_tx.send(());
+                }
+            });
+        });
+
+        let (hooks, state_rx) = ReconnectHooks::new();
+        let ch = AutoChannel::with_hooks_and_keepalive(
+            factory,
+            spawner,
+            AutoConfig::default(),
+            hooks,
+            state_rx,
+            Some(KeepaliveConfig {
+                interval: Duration::from_secs(60),
+                timeout: Duration::from_secs(60),
+            }),
+        );
+
+        let raw_channel = ch.ensure().await;
+        drop(raw_channel);
+        drop(ch);
+        drop(server);
+
+        tokio::time::timeout(Duration::from_secs(1), driver_done_rx.recv())
+            .await
+            .expect("driver should not wait for keepalive sleep")
+            .expect("driver completion signal");
     }
 }

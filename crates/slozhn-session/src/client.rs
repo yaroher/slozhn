@@ -11,6 +11,7 @@
 //!   (`None`), the frame driver dies, RPCs get UNAVAILABLE.
 
 use std::collections::VecDeque;
+use std::fmt::Write as _;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -19,18 +20,26 @@ use std::time::Duration;
 use bytes::Bytes;
 use futures::future::BoxFuture;
 use futures::{Future, Sink, SinkExt, Stream, StreamExt};
-use slozhn_frame::proto::v1::{frame, Frame, Hello};
 use slozhn_frame::TransportClosed;
+use slozhn_frame::proto::v1::{Frame, Hello, frame};
 
-use slozhn_frame::transport::{jittered, ConnState, ReconnectHooks};
+use slozhn_frame::transport::{ConnState, ReconnectHooks, jittered};
 
-use crate::core::{sessioned, Ingress, SessionCore};
+use crate::core::{Ingress, SessionCore, sessioned};
 use crate::{SessionConfig, SessionError};
 
 pub use slozhn_frame::transport::{BoxFrameTransport, FrameDuplex};
 
 pub type Factory =
     Arc<dyn Fn() -> BoxFuture<'static, Result<BoxFrameTransport, String>> + Send + Sync>;
+
+fn session_label(session_id: &Bytes) -> String {
+    let mut out = String::with_capacity(16);
+    for b in session_id.iter().take(8) {
+        let _ = write!(&mut out, "{b:02x}");
+    }
+    out
+}
 
 /// First connect + Hello handshake of a new session. Returns the transport
 /// and the server's Hello — for `bind_pre_negotiated`.
@@ -53,28 +62,42 @@ pub async fn connect_session_hooked(
     hooks: ReconnectHooks,
 ) -> Result<(SessionTransport, Hello), SessionError> {
     hooks.set(ConnState::Connecting);
-    let mut t = (factory)()
-        .await
-        .map_err(SessionError::Handshake)?;
+    tracing::debug!("session initial connect starting");
+    let mut t = (factory)().await.map_err(|e| {
+        tracing::warn!(error = %e, "session initial transport connect failed");
+        SessionError::Handshake(e)
+    })?;
     t.send(hello_frame(&frame_config, Bytes::new(), Bytes::new(), 0))
         .await
-        .map_err(|_| SessionError::Handshake("transport closed during hello".into()))?;
-    let first = t
-        .next()
-        .await
-        .ok_or_else(|| SessionError::Handshake("closed before hello reply".into()))?;
+        .map_err(|_| {
+            tracing::warn!("session transport closed during initial hello");
+            SessionError::Handshake("transport closed during hello".into())
+        })?;
+    let first = t.next().await.ok_or_else(|| {
+        tracing::warn!("session transport closed before initial hello reply");
+        SessionError::Handshake("closed before hello reply".into())
+    })?;
     let peer = match first.kind {
         Some(frame::Kind::Hello(h)) if !h.resume_rejected => h,
-        Some(frame::Kind::Hello(_)) => return Err(SessionError::ResumeRejected),
-        _ => return Err(SessionError::Handshake("expected hello reply".into())),
+        Some(frame::Kind::Hello(_)) => {
+            tracing::warn!("session initial hello was rejected");
+            return Err(SessionError::ResumeRejected);
+        }
+        _ => {
+            tracing::warn!("session initial handshake received non-hello frame");
+            return Err(SessionError::Handshake("expected hello reply".into()));
+        }
     };
     if peer.session_id.is_empty() {
         // server without a session layer: seq frames would be silently
         // dropped — refuse explicitly instead of a quiet incompatibility
+        tracing::warn!("session initial hello had no session id");
         return Err(SessionError::Handshake(
             "server has no session support (use grpc_ws_session)".into(),
         ));
     }
+    let session_log_id = session_label(&peer.session_id);
+    tracing::info!(session_id = %session_log_id, last_recv_seq = peer.last_recv_seq, "session established");
     hooks.set(ConnState::Connected);
     let transport = SessionTransport {
         phase: Phase::Active(t),
@@ -82,6 +105,7 @@ pub async fn connect_session_hooked(
         factory,
         frame_config,
         session_id: peer.session_id.clone(),
+        session_log_id,
         token: peer.resume_token.clone(),
         pending_out: VecDeque::new(),
         ack_timer: None,
@@ -132,6 +156,7 @@ pub struct SessionTransport {
     factory: Factory,
     frame_config: slozhn_frame::connection::Config,
     session_id: Bytes,
+    session_log_id: String,
     token: Bytes,
     pending_out: VecDeque<Frame>,
     ack_timer: Option<futures_timer::Delay>,
@@ -152,7 +177,11 @@ enum FlushOutcome {
 
 impl SessionTransport {
     /// Drain pending_out into the transport. Broken = physical disconnect.
-    fn try_flush(t: &mut BoxFrameTransport, pending: &mut VecDeque<Frame>, cx: &mut Context<'_>) -> FlushOutcome {
+    fn try_flush(
+        t: &mut BoxFrameTransport,
+        pending: &mut VecDeque<Frame>,
+        cx: &mut Context<'_>,
+    ) -> FlushOutcome {
         while !pending.is_empty() {
             match t.poll_ready_unpin(cx) {
                 Poll::Ready(Ok(())) => {
@@ -173,6 +202,12 @@ impl SessionTransport {
 
     /// Disconnect: pending is cleared (sessioned frames are already in the replay buffer), reconnect.
     fn go_reconnect(&mut self) {
+        tracing::debug!(
+            session_id = %self.session_log_id,
+            last_recv_seq = self.core.last_recv_seq(),
+            pending_out = self.pending_out.len(),
+            "session physical transport disconnected; reconnecting",
+        );
         self.pending_out.clear();
         self.ack_timer = None;
         self.kick_wait = None;
@@ -196,7 +231,11 @@ impl Stream for SessionTransport {
                         this.kick_wait = Some(Box::pin(async move { kick.notified().await }));
                     }
                     let kicked = matches!(
-                        this.kick_wait.as_mut().expect("armed above").as_mut().poll(cx),
+                        this.kick_wait
+                            .as_mut()
+                            .expect("armed above")
+                            .as_mut()
+                            .poll(cx),
                         Poll::Ready(())
                     );
                     match Pin::new(delay).poll(cx) {
@@ -205,12 +244,18 @@ impl Stream for SessionTransport {
                         Poll::Pending => return Poll::Pending,
                     }
                     this.kick_wait = None;
+                    tracing::debug!("session reconnect backoff elapsed");
                     this.hooks.set(ConnState::Connecting);
                     this.phase = Phase::Connecting((this.factory)());
                 }
 
                 Phase::Connecting(fut) => match fut.as_mut().poll(cx) {
                     Poll::Ready(Ok(t)) => {
+                        tracing::debug!(
+                            session_id = %this.session_log_id,
+                            last_recv_seq = this.core.last_recv_seq(),
+                            "session physical reconnect established; sending resume hello",
+                        );
                         this.pending_out.push_front(hello_frame(
                             &this.frame_config,
                             this.session_id.clone(),
@@ -223,8 +268,16 @@ impl Stream for SessionTransport {
                         this.attempt += 1;
                         let delay = jittered(this.backoff_cur);
                         this.backoff_cur = (this.backoff_cur * 2).min(this.backoff_max);
-                        this.hooks
-                            .set(ConnState::Backoff { delay, attempt: this.attempt });
+                        tracing::warn!(
+                            session_id = %this.session_log_id,
+                            attempt = this.attempt,
+                            delay_ms = delay.as_millis(),
+                            "session physical reconnect failed",
+                        );
+                        this.hooks.set(ConnState::Backoff {
+                            delay,
+                            attempt: this.attempt,
+                        });
                         this.phase = Phase::Backoff(futures_timer::Delay::new(delay));
                     }
                     Poll::Pending => return Poll::Pending,
@@ -242,6 +295,10 @@ impl Stream for SessionTransport {
                         Poll::Ready(Some(f)) => match f.kind {
                             Some(frame::Kind::Hello(h)) => {
                                 if h.resume_rejected {
+                                    tracing::warn!(
+                                        session_id = %this.session_log_id,
+                                        "session resume rejected by server"
+                                    );
                                     this.hooks.set(ConnState::Disconnected);
                                     this.phase = Phase::Dead;
                                     return Poll::Ready(None);
@@ -250,6 +307,12 @@ impl Stream for SessionTransport {
                                 this.attempt = 0;
                                 this.hooks.set(ConnState::Connected);
                                 let replay = this.core.replay_after(h.last_recv_seq);
+                                tracing::info!(
+                                    session_id = %this.session_log_id,
+                                    server_last_recv_seq = h.last_recv_seq,
+                                    replay_frames = replay.len(),
+                                    "session resume accepted",
+                                );
                                 this.pending_out.extend(replay);
                                 let Phase::Resuming(t) =
                                     std::mem::replace(&mut this.phase, Phase::Dead)
@@ -260,6 +323,10 @@ impl Stream for SessionTransport {
                             }
                             _ => {
                                 // garbage before Hello — protocol filth
+                                tracing::warn!(
+                                    session_id = %this.session_log_id,
+                                    "session resume received non-hello frame"
+                                );
                                 this.hooks.set(ConnState::Disconnected);
                                 this.phase = Phase::Dead;
                                 return Poll::Ready(None);
@@ -347,6 +414,10 @@ impl Sink<Frame> for SessionTransport {
                 Ok(())
             }
             Err(_) => {
+                tracing::warn!(
+                    session_id = %this.session_log_id,
+                    "session replay buffer overflow; closing logical session"
+                );
                 this.phase = Phase::Dead;
                 Err(TransportClosed)
             }

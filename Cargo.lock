@@ -876,6 +876,7 @@ dependencies = [
  "tokio",
  "tonic",
  "tower",
+ "tracing",
 ]
 
 [[package]]
@@ -891,6 +892,7 @@ dependencies = [
  "slozhn-proto",
  "thiserror",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -957,6 +959,7 @@ dependencies = [
  "tokio",
  "tonic",
  "tower",
+ "tracing",
 ]
 
 [[package]]
@@ -970,6 +973,7 @@ dependencies = [
  "slozhn-frame",
  "thiserror",
  "tokio",
+ "tracing",
  "uuid",
 ]
 

@@ -139,18 +139,56 @@ let channel = slozhn::client::builder(url)
         initial_backoff: Duration::from_millis(200),
         max_backoff: Duration::from_secs(10),
     })
-    .resume()   // session backoff inherits reconnect_config;
-                // .resume_with(SessionConfig{..}) to control it separately
+    .keepalive_config(Some(slozhn_client::reconnect::KeepaliveConfig {
+        interval: Duration::from_secs(30),
+        timeout: Duration::from_secs(10),
+    }))
     .build();
 
 let mut state = channel.state(); // tokio watch: Idle/Connecting/Backoff{delay,attempt}/Connected/Disconnected
 channel.reconnect_now();         // punch through a backoff wait (a "retry now" button)
 ```
 
+For stream resume, enable the session layer. Its reconnect backoff inherits
+`reconnect_config`; use `.resume_with(SessionConfig{..})` to control it
+separately.
+
+```rust
+let channel = slozhn::client::builder(url)
+    .reconnect_config(slozhn_client::reconnect::AutoConfig {
+        initial_backoff: Duration::from_millis(200),
+        max_backoff: Duration::from_secs(10),
+    })
+    .resume()   // session backoff inherits reconnect_config;
+                // .resume_with(SessionConfig{..}) to control it separately
+    .build();
+```
+
 Backoff is exponential with equal jitter (default 100 ms → 5 s). `Backoff`
 carries the chosen delay and the attempt number — render your own countdown
 from receipt time (wasm has no portable clock, so no absolute deadline is
 exposed).
+
+Raw channels also send Ping/Pong keepalives by default (`30s` interval,
+`10s` timeout). Call `.keepalive_config(None)` to disable it. Session channels
+do not use logical keepalive pings during reconnect gaps; the session transport
+publishes reconnect state and resumes the logical connection itself.
+
+## Graceful server drain
+
+Keep a `ConnectionRegistry` next to your axum server and route through the
+`*_with_registry` helpers. On process shutdown, drain live WS connections
+before stopping the listener:
+
+```rust
+let registry = slozhn::server::ConnectionRegistry::new();
+let app = axum::Router::new().route(
+    "/rpc",
+    slozhn::server::grpc_ws_session_with_registry(routes, manager, registry.clone()),
+);
+
+registry.drain_all(slozhn::frame::GoAwayCode::Graceful);
+```
 
 ## Middleware (feature `middleware`)
 
