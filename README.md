@@ -135,13 +135,13 @@ make test          # cargo test + clippy (native)
 make test-wasm     # wasm32 build + clippy
 make test-browser  # browser e2e (wasm-pack, headless chrome)
 make gen           # regen crates/slozhn-proto after .proto edits
-make release       # interactive tag-driven release (crates.io [+ npm])
+make release       # interactive tag-driven release to crates.io
 ```
 
 Releases are tag-driven: `make release` bumps one version across the cargo
 workspace, commits, tags `vX.Y.Z`, and pushes; `.github/workflows/release.yml`
 re-runs CI, creates a GitHub release, and publishes the crates to crates.io
-(secrets: `CARGO_REGISTRY_TOKEN`; `NPM_TOKEN` once npm packages exist).
+(secret: `CARGO_REGISTRY_TOKEN`).
 
 ## Status
 

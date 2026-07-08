@@ -13,7 +13,7 @@ help:
 	@echo "make test-wasm     - wasm32 build + clippy"
 	@echo "make test-browser  - browser e2e (wasm-pack, headless chrome)"
 	@echo "make doc           - cargo doc"
-	@echo "make release       - interactive tag-driven release (crates.io + npm share one version)"
+	@echo "make release       - interactive tag-driven release to crates.io"
 	@echo "make publish-crates- publish all crates to crates.io in dependency order (used by CI)"
 
 # --- codegen -----------------------------------------------------------------
@@ -49,9 +49,8 @@ publish-crates:
 
 # --- release -----------------------------------------------------------------
 # One version drives everything: the workspace is tagged vX.Y.Z; all internal
-# crate versions (and npm workspaces, once they exist) are bumped to the same
-# X.Y.Z. Pushing the tag triggers .github/workflows/release.yml, which re-runs
-# CI, creates a GitHub release, and publishes to crates.io (and npm).
+# crate versions are bumped to the same X.Y.Z. Pushing the tag triggers .github/workflows/release.yml, which re-runs
+# CI, creates a GitHub release, and publishes to crates.io.
 
 release:
 	@set -euo pipefail
@@ -74,15 +73,12 @@ release:
 	echo "  3) cancel"
 	read -r -p "> " action
 
-	set_version() { # $$1 = new version (no v prefix); syncs workspace + internal dep reqs + npm workspaces
+	set_version() { # $$1 = new version (no v prefix); syncs workspace + internal dep reqs
 	  new="$$1"
 	  old="$$manifest_cur"
 	  sed -i "0,/^version = \"$$old\"$$/s//version = \"$$new\"/" Cargo.toml
 	  sed -i "/slozhn/s/version = \"$$old\"/version = \"$$new\"/g" crates/*/Cargo.toml
 	  easyp generate  # regenerate slozhn-proto Cargo.toml from the template
-	  if [ -f package.json ] && grep -q '"workspaces"' package.json; then
-	    npm version "$$new" --no-git-tag-version --workspaces >/dev/null
-	  fi
 	  cargo check --workspace --quiet  # sanity: versions consistent
 	}
 
@@ -103,7 +99,7 @@ release:
 	  new="$$MA.$$MI.$$PA"
 	  echo
 	  echo "Release v$$new — will:"
-	  echo "  - set version $$new across the cargo workspace (and npm workspaces, if any)"
+	  echo "  - set version $$new across the cargo workspace"
 	  echo "  - commit 'release v$$new'"
 	  echo "  - create tag v$$new and push HEAD + tag (triggers CI release)"
 	  read -r -p "Type 'yes' to proceed: " ok
