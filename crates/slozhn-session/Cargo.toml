@@ -9,7 +9,7 @@ description = "Resume layer for slozhn: seq/ack/replay, streams survive reconnec
 
 [dependencies]
 metrics = "0.24"
-slozhn-frame = { path = "../slozhn-frame", version = "1.0.3" }
+slozhn-frame = { path = "../slozhn-frame", version = "1.1.0" }
 prost.workspace = true
 bytes.workspace = true
 futures.workspace = true

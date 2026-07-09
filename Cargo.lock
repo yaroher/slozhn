@@ -1644,7 +1644,7 @@ checksum = "0c790de23124f9ab44544d7ac05d60440adc586479ce501c1d6d7da3cd8c9cf5"
 
 [[package]]
 name = "slozhn"
-version = "1.0.3"
+version = "1.1.0"
 dependencies = [
  "futures",
  "http",
@@ -1660,7 +1660,7 @@ dependencies = [
 
 [[package]]
 name = "slozhn-client"
-version = "1.0.3"
+version = "1.1.0"
 dependencies = [
  "bytes",
  "futures",
@@ -1679,7 +1679,7 @@ dependencies = [
 
 [[package]]
 name = "slozhn-frame"
-version = "1.0.3"
+version = "1.1.0"
 dependencies = [
  "bytes",
  "criterion",
@@ -1714,7 +1714,7 @@ dependencies = [
 
 [[package]]
 name = "slozhn-middleware"
-version = "1.0.3"
+version = "1.1.0"
 dependencies = [
  "bytes",
  "fastrand",
@@ -1744,7 +1744,7 @@ dependencies = [
 
 [[package]]
 name = "slozhn-proto"
-version = "1.0.3"
+version = "1.1.0"
 dependencies = [
  "bytes",
  "prost",
@@ -1755,7 +1755,7 @@ dependencies = [
 
 [[package]]
 name = "slozhn-server"
-version = "1.0.3"
+version = "1.1.0"
 dependencies = [
  "axum",
  "bytes",
@@ -1775,7 +1775,7 @@ dependencies = [
 
 [[package]]
 name = "slozhn-session"
-version = "1.0.3"
+version = "1.1.0"
 dependencies = [
  "bytes",
  "futures",
@@ -1792,7 +1792,7 @@ dependencies = [
 
 [[package]]
 name = "slozhn-ws"
-version = "1.0.3"
+version = "1.1.0"
 dependencies = [
  "bytes",
  "futures",
