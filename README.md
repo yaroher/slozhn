@@ -191,6 +191,18 @@ Raw channels also send Ping/Pong keepalives by default (`30s` interval,
 do not use logical keepalive pings during reconnect gaps; the session transport
 publishes reconnect state and resumes the logical connection itself.
 
+## Performance
+
+`cargo bench -p slozhn-frame` (criterion; figures below from an Intel
+i5-14600K, in-memory loopback — no sockets, so they bound the protocol
+machinery, not your network):
+
+| Benchmark | Result |
+|---|---|
+| Frame codec, 1 KiB message encode+decode | ~61 ns (~15.6 GiB/s) |
+| Full stack echo, 1 KiB (open → send → echo → recv) | ~3.8 µs/call |
+| 100 × 4 KiB burst down one stream (flow control engaged) | ~84 µs (~4.5 GiB/s) |
+
 ## Graceful server drain
 
 Keep a `ConnectionRegistry` next to your axum server and route through the
@@ -206,6 +218,54 @@ let app = axum::Router::new().route(
 
 registry.drain_all(slozhn::frame::GoAwayCode::Graceful);
 ```
+
+### Limits & observability
+
+Both resource axes are capped by default: `frame::Config.max_streams`
+(1024 concurrent streams per connection — inbound opens over the limit get
+`RESOURCE_EXHAUSTED`, local opens fail with `OpenError::LimitExceeded`) and
+`ServerSessionConfig.max_sessions` (10 000 — new sessions beyond the cap are
+rejected with a `resume_rejected` Hello; resumes of existing sessions always
+pass). For metrics, poll `SessionManager::session_count()` and
+`ConnectionRegistry::len()`.
+
+gRPC server reflection and `grpc.health.v1.Health` are ordinary tonic
+services and work over the bridge unmodified — add `tonic-reflection` /
+`tonic-health` to your app and register them in the same `Routes`
+(see `router_full()` in `examples/echo-ws`).
+
+## Gateway: deploy business logic without dropping clients
+
+Long-lived WS connections shouldn't die every time business logic
+redeploys. Split into two tiers: a thin gateway (slozhn WS + sessions,
+rarely deployed) that proxies every gRPC call over regular HTTP/2 to an
+upstream app tier (a plain tonic server, deploys freely):
+
+```
+ browser/client                gateway tier               app tier
+┌──────────────┐   WS/slozhn  ┌───────────────┐  HTTP/2   ┌──────────────┐
+│ slozhn client│─────────────▶│ grpc_ws +      │──────────▶│ tonic server │
+│ (EchoClient) │◀─────────────│ GrpcProxy      │◀──────────│ (redeploys)  │
+└──────────────┘  survives    └───────────────┘  Channel   └──────────────┘
+                  app deploys   (rarely deploys) connect_lazy
+```
+
+`grpc_ws` accepts any tower `Service`, so `grpc_proxy` is a ready-made one
+that forwards to a `tonic::transport::Channel`:
+
+```rust
+let upstream = tonic::transport::Channel::from_shared(format!("http://{app_addr}"))?
+    .connect_lazy();
+let proxy = slozhn::server::grpc_proxy(upstream);
+let app = axum::Router::new().route("/rpc", slozhn::server::grpc_ws(proxy));
+```
+
+WS connections and sessions live in the thin gateway, which rarely
+redeploys; the app tier restarts freely behind it. An app-tier restart
+surfaces to in-flight calls as `UNAVAILABLE` on that single RPC — the WS
+channel itself is untouched — and `RetryLayer` + `DedupLayer` (see
+Middleware below) already recover that exactly-once for idempotent
+methods, so a redeploy is invisible to the caller beyond one retried call.
 
 ## Middleware (feature `middleware`)
 
@@ -274,6 +334,189 @@ explicit `never_retry_method(...)` entries win over descriptors. The index
 takes manual markers in the same builder style — `idempotent_method(...)`,
 `no_side_effects_methods([...])`, `unknown_method(...)` (overrides a
 descriptor marker) — for methods you can't annotate.
+
+Server-side, `DedupLayer` (non-wasm) completes the story: a replay carrying
+the same `x-idempotency-key` gets back the cached response (any terminal
+outcome, bodies up to 256 KiB, 300 s TTL by default) instead of re-executing
+the handler:
+
+```rust
+let deduped = slozhn::middleware::DedupLayer::default().layer(routes);
+Router::new().route("/rpc", slozhn::server::grpc_ws(deduped));
+```
+
+Entries live in a pluggable `DedupStore` (default: per-process
+`InMemoryDedupStore`). Behind a load balancer pass a shared implementation
+via `.store(...)` — `CachedResponse` is plain data (status, header pairs,
+bytes) so it serializes trivially to Redis (`SET key blob EX ttl` / `GET`).
+Store errors fail open: the handler runs, nothing is cached. Concurrent
+same-key requests on one node single-flight: only the first executes, the
+rest wait and read the cache (cross-node duplicates may still race — that
+would need store-side locking).
+
+### Scaling out
+
+Every stateful server layer takes an external store, so a multi-node
+deployment only has to share it: `DedupLayer::store(...)` and
+`RateLimitLayer::store(...)` accept `Arc<dyn DedupStore>` /
+`Arc<dyn RateLimitStore>`, and with a shared store the guarantees hold
+fleet-wide (covered by `examples/echo-ws/tests/ws_multinode_e2e.rs`). The
+remaining layers are stateless per call — Trace/otel (`traceparent` even
+correlates spans across nodes), Auth, and the client-side
+Retry/Idempotency/Timeout — so they scale without coordination. The one
+sticky thing is the **session layer** (`grpc_ws_session`): resume state is
+per-process, so a balancer must pin a client's reconnects to the node that
+holds its session (or resume is honestly rejected and the client starts a
+fresh session).
+
+Note the session id itself travels inside protocol frames, invisible to the
+balancer — pin by a proxy attribute instead. With Caddy, a sticky cookie
+(browsers attach cookies to WS upgrade requests automatically):
+
+```caddyfile
+example.com {
+    reverse_proxy /rpc node1:8080 node2:8080 {
+        lb_policy cookie slozhn_node
+    }
+}
+```
+
+For non-browser clients that don't persist cookies, use
+`lb_policy client_ip_hash` instead. Getting unpinned is not fatal either
+way: the resume is rejected, `AutoChannel` starts a fresh session, and the
+retry + shared-store dedup layers recover idempotent calls exactly once.
+
+### Deadlines
+
+`TimeoutLayer` races each call against a local timer and sets the standard
+`grpc-timeout` header (unless the caller already did) so the server enforces
+the same deadline. On expiry the pending RPC is canceled and the call fails
+with `TimeoutError::Elapsed`. Place it above `RetryLayer` if the deadline
+should cover all attempts; timeouts are never retried.
+
+```rust
+let stack = tower::ServiceBuilder::new()
+    .layer(slozhn::middleware::TimeoutLayer::new(Duration::from_secs(10)))
+    .layer(slozhn::middleware::RetryLayer::from_file_descriptor_set(fds)?)
+    .service(channel);
+```
+
+Server-side, `DeadlineLayer` (non-wasm) enforces the received `grpc-timeout`
+— native tonic transport does this, a bare WS bridge would not: the handler
+is cancelled on expiry (trailers-only `DEADLINE_EXCEEDED`), and a streaming
+response that outlives the deadline is cut off mid-stream the same way.
+`.max(...)` bounds worst-case handler runtime regardless of what callers ask
+for:
+
+```rust
+let deadlined = slozhn::middleware::DeadlineLayer::new()
+    .max(Duration::from_secs(30))
+    .layer(routes);
+```
+
+### Metrics
+
+`MetricsLayer::client()` / `::server()` emit through the exporter-agnostic
+[`metrics`](https://docs.rs/metrics) facade — wire any exporter
+(`metrics-exporter-prometheus`, ...) at process start:
+
+- `slozhn_rpc_started_total{side, method}` — counter;
+- `slozhn_rpc_inflight{side}` — gauge, leak-proof decrement on any exit;
+- `slozhn_rpc_duration_seconds{side, method, code}` — histogram, `code` is
+  the grpc-status (or `"error"` for transport failures).
+
+The transport and middleware layers also emit through the same facade
+(no layer needed — they fire at the source):
+
+- `slozhn_reconnects_total{outcome}` — client connection attempts (ok/fail);
+- `slozhn_session_resume_total{outcome}` — resume handshakes (ok/rejected/error);
+- `slozhn_sessions_active`, `slozhn_ws_connections_active` — server gauges;
+- `slozhn_sessions_rejected_total` — `max_sessions` cap hits;
+- `slozhn_rate_limited_total{method}`, `slozhn_auth_rejected_total{code}`,
+  `slozhn_dedup_hits_total`, `slozhn_retries_total{method}`,
+  `slozhn_deadline_exceeded_total{stage}` — middleware events.
+
+Without an installed `metrics` recorder all of this is a no-op.
+
+To ship them through OpenTelemetry instead of a Prometheus scrape, the
+`otel` feature provides a recorder bridging the whole `metrics` facade
+(these series and any of your own) into an OTel `Meter`:
+
+```rust
+let provider = opentelemetry_sdk::metrics::SdkMeterProvider::builder()
+    .with_reader(/* OTLP exporter / Prometheus reader */)
+    .build();
+metrics::set_global_recorder(
+    slozhn::middleware::otel_metrics_recorder(provider.meter("slozhn")),
+)?;
+```
+
+### Load shedding
+
+The layers keep the tower readiness contract (reserved `poll_ready`
+capacity is never leaked), so standard tower limiters compose directly.
+Server-side, cap in-flight RPCs per node (`grpc_ws` needs an infallible
+service, so use back-pressure via `concurrency_limit` rather than
+`load_shed`, which changes the error type):
+
+```rust
+let limited = tower::limit::ConcurrencyLimitLayer::new(1024)
+    .layer(slozhn::middleware::trace_server(routes));
+```
+
+Client-side, `load_shed` works too — tonic stubs map the shed error through
+`Status::from_error`:
+
+```rust
+let stack = tower::ServiceBuilder::new()
+    .load_shed()
+    .concurrency_limit(256)
+    .service(channel);
+```
+
+### Compression
+
+The bridge carries opaque length-prefixed gRPC message bytes (the 5-byte
+prefix already encodes the compressed-flag), and metadata/headers travel
+inside protocol frames — so tonic's standard per-message gzip compression
+works over the WS transport unchanged, no bridge-side support needed. Enable
+the `gzip` feature on `tonic` in your app's `Cargo.toml`, then use the usual
+codegen builder methods:
+
+```rust
+// server
+let echo = EchoServer::new(EchoImpl)
+    .accept_compressed(tonic::codec::CompressionEncoding::Gzip)
+    .send_compressed(tonic::codec::CompressionEncoding::Gzip);
+Router::new().route("/rpc", slozhn::server::grpc_ws(tonic::service::Routes::new(echo)));
+
+// client
+let mut client = EchoClient::new(channel)
+    .send_compressed(tonic::codec::CompressionEncoding::Gzip)
+    .accept_compressed(tonic::codec::CompressionEncoding::Gzip);
+```
+
+### Rate limiting
+
+`RateLimitLayer` (server, non-wasm) enforces GCRA quotas — precise sustained
+rate with configurable instant burst — per method × caller key. Over-limit
+calls get `RESOURCE_EXHAUSTED` with `retry-after` metadata (seconds):
+
+```rust
+let limited = slozhn::middleware::RateLimitLayer::new(Quota::per_second(50))
+    .method_quota("/shop.v1.Shop/Search", Quota::per_second(200).burst(400))
+    .unlimited_method("/grpc.health.v1.Health/Check")
+    .key_by_header("authorization")   // bucket per caller, "anon" if absent
+    .layer(routes);
+Router::new().route("/rpc", slozhn::server::grpc_ws(limited));
+```
+
+State lives in a pluggable `RateLimitStore`. The built-in `InMemoryStore` is
+per-process; behind a load balancer implement the trait over a shared store
+(with Redis: redis-cell's `CL.THROTTLE`, or a small Lua compare-and-set on
+the stored arrival time — the decision must be atomic in the store). Store
+errors fail open by default (availability over strictness); `.fail_closed()`
+turns them into `UNAVAILABLE`.
 
 ### Authentication
 

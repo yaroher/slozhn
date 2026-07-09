@@ -76,6 +76,18 @@ pub fn router() -> axum::Router {
 }
 
 
+/// Server router with standard tonic per-message gzip compression enabled:
+/// the bridge carries opaque length-prefixed gRPC message bytes (the 5-byte
+/// prefix already encodes the compressed-flag), so tonic's built-in codec
+/// compression works over the WS transport with no bridge changes.
+pub fn router_compressed() -> axum::Router {
+    let echo = EchoServer::new(EchoImpl)
+        .accept_compressed(tonic::codec::CompressionEncoding::Gzip)
+        .send_compressed(tonic::codec::CompressionEncoding::Gzip);
+    let routes = tonic::service::Routes::new(echo);
+    axum::Router::new().route("/rpc", slozhn::server::grpc_ws(routes))
+}
+
 /// Channel with auto-reconnect (no resume: active RPCs fail on a break).
 pub fn auto_channel(url: String) -> slozhn::client::Channel {
     slozhn::client::builder(url).build()
@@ -92,4 +104,48 @@ pub fn router_session() -> axum::Router {
     let routes = tonic::service::Routes::new(EchoServer::new(EchoImpl));
     let manager = slozhn::server::SessionManager::new(Default::default());
     axum::Router::new().route("/rpc", slozhn::server::grpc_ws_session(routes, manager))
+}
+
+/// Server router with the session layer and an externally observable
+/// [`SessionManager`](slozhn::server::SessionManager) +
+/// [`ConnectionRegistry`](slozhn::server::ConnectionRegistry), for tests that
+/// assert on live session/connection counts.
+pub fn router_session_with_registry() -> (
+    axum::Router,
+    std::sync::Arc<slozhn::server::SessionManager>,
+    slozhn::server::ConnectionRegistry,
+) {
+    let routes = tonic::service::Routes::new(EchoServer::new(EchoImpl));
+    let manager = slozhn::server::SessionManager::new(Default::default());
+    let registry = slozhn::server::ConnectionRegistry::new();
+    let router = axum::Router::new().route(
+        "/rpc",
+        slozhn::server::grpc_ws_session_with_registry(routes, manager.clone(), registry.clone()),
+    );
+    (router, manager, registry)
+}
+
+/// Full server router: `EchoServer` + gRPC server reflection (v1) + the
+/// `grpc.health.v1.Health` service, all reachable over the WS bridge on
+/// `/rpc`. Reflection and health are app-level wiring (any tonic `Routes`
+/// works over the bridge unmodified), so they live here rather than in a
+/// library crate.
+pub fn router_full() -> axum::Router {
+    let (health_reporter, health_service) = tonic_health::server::health_reporter();
+    // Uncontended lock, resolves immediately — no need for a tokio runtime.
+    futures::executor::block_on(health_reporter.set_serving::<EchoServer<EchoImpl>>());
+
+    let reflection_service = tonic_reflection::server::Builder::configure()
+        .register_encoded_file_descriptor_set(slozhn_proto::testing::v1::FILE_DESCRIPTOR_SET)
+        .build_v1()
+        .expect("valid file descriptor set");
+
+    let mut builder = tonic::service::Routes::builder();
+    builder
+        .add_service(EchoServer::new(EchoImpl))
+        .add_service(reflection_service)
+        .add_service(health_service);
+    let routes = builder.routes();
+
+    axum::Router::new().route("/rpc", slozhn::server::grpc_ws(routes))
 }

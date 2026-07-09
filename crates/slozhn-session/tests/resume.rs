@@ -284,3 +284,172 @@ async fn keepalive_detects_silent_peer_and_reconnects() {
     }
     assert!(saw_ping, "client must have sent a keepalive ping");
 }
+
+/// Client-side "fresh hello" frame (mirrors what `connect_session` sends).
+fn client_hello() -> Frame {
+    Frame {
+        stream_id: 0,
+        seq: 0,
+        kind: Some(frame::Kind::Hello(Hello {
+            version: 1,
+            initial_stream_window: 65536,
+            initial_connection_window: 65536,
+            session_id: Bytes::new(),
+            resume_token: Bytes::new(),
+            last_recv_seq: 0,
+            resume_rejected: false,
+        })),
+    }
+}
+
+#[tokio::test]
+async fn max_sessions_limit_rejects_new_session() {
+    use slozhn_session::server::{ServerSessionConfig, SessionManager};
+
+    let manager = SessionManager::new(ServerSessionConfig {
+        max_sessions: 1,
+        ..Default::default()
+    });
+
+    // first accept: under the limit, becomes a live session
+    let (client_end1, server_end1) = loopback::pair();
+    let mut client_end1: BoxFrameTransport = Box::pin(client_end1);
+    client_end1.send(client_hello()).await.unwrap();
+    let accepted1 = manager
+        .accept(Box::pin(server_end1))
+        .await
+        .expect("accept ok");
+    assert!(accepted1.is_some(), "first session must be accepted");
+    let hello1 = client_end1.next().await.expect("hello reply");
+    match hello1.kind {
+        Some(frame::Kind::Hello(h)) => assert!(!h.resume_rejected),
+        other => panic!("expected hello, got {other:?}"),
+    }
+
+    // second accept: over the limit, must be rejected with resume_rejected hello
+    let (client_end2, server_end2) = loopback::pair();
+    let mut client_end2: BoxFrameTransport = Box::pin(client_end2);
+    client_end2.send(client_hello()).await.unwrap();
+    let accepted2 = manager
+        .accept(Box::pin(server_end2))
+        .await
+        .expect("accept ok");
+    assert!(
+        accepted2.is_none(),
+        "second session must be rejected due to max_sessions"
+    );
+    let hello2 = client_end2.next().await.expect("rejected hello reply");
+    match hello2.kind {
+        Some(frame::Kind::Hello(h)) => {
+            assert!(h.resume_rejected, "must be rejected");
+            assert!(h.session_id.is_empty());
+            assert!(h.resume_token.is_empty());
+        }
+        other => panic!("expected hello, got {other:?}"),
+    }
+}
+
+/// Sink backpressure must stall the caller instead of killing the session
+/// when the replay buffer fills up during an outage, and must release once
+/// the peer acks the backlog after a resume.
+#[tokio::test]
+async fn sink_backpressure_stalls_then_releases_after_resume_ack() {
+    use slozhn_frame::proto::v1::Ack;
+
+    let (factory, mut srv_rx) = make_factory();
+
+    let cfg = SessionConfig {
+        replay_buffer_bytes: 256, // tiny — a handful of frames fills it
+        keepalive_interval: None,
+        ..quiet_session_config()
+    };
+
+    let connect = tokio::spawn(connect_session(
+        factory,
+        slozhn_frame::connection::Config::default(),
+        cfg,
+    ));
+
+    let mut srv1 = srv_rx.recv().await.expect("first transport");
+    let _client_hello = srv1.next().await.expect("client hello");
+    srv1.send(hello(b"s1", b"t1", 0, false)).await.unwrap();
+    let (transport, _peer) = connect.await.unwrap().expect("connected");
+
+    // kill the server side of the physical connection
+    drop(srv1);
+
+    // spawned task: keeps sending; reports each successful send's index
+    let (progress_tx, mut progress_rx) = tokio::sync::mpsc::unbounded_channel::<u32>();
+    let mut transport = transport;
+    let sender = tokio::spawn(async move {
+        for i in 0..500u32 {
+            if transport.send(msg(1, (i % 256) as u8)).await.is_err() {
+                break;
+            }
+            let _ = progress_tx.send(i);
+        }
+    });
+
+    // some sends complete (buffer has room initially)…
+    let mut last_seen = None;
+    while let Ok(Some(i)) =
+        tokio::time::timeout(Duration::from_millis(200), progress_rx.recv()).await
+    {
+        last_seen = Some(i);
+    }
+    assert!(
+        last_seen.is_some(),
+        "expected at least one send to succeed before the buffer fills"
+    );
+
+    // …then it must get stuck: no further progress within 200ms — the sink
+    // is applying backpressure instead of overflowing and killing the session
+    let stuck = tokio::time::timeout(Duration::from_millis(200), progress_rx.recv()).await;
+    assert!(
+        stuck.is_err(),
+        "sender must be stalled by backpressure, not still progressing"
+    );
+    assert!(!sender.is_finished(), "session must not have died");
+
+    // reconnect: the factory hands us a fresh pipe automatically once the
+    // transport notices the old one is gone and retries
+    let mut srv2 = tokio::time::timeout(Duration::from_secs(2), srv_rx.recv())
+        .await
+        .expect("reconnect must happen")
+        .expect("second transport");
+    let resume = tokio::time::timeout(Duration::from_secs(1), srv2.next())
+        .await
+        .expect("resume hello must arrive")
+        .expect("resume hello frame");
+    match &resume.kind {
+        Some(frame::Kind::Hello(h)) => {
+            assert_eq!(h.session_id.as_ref(), b"s1");
+            assert_eq!(h.resume_token.as_ref(), b"t1");
+        }
+        other => panic!("expected resume hello, got {other:?}"),
+    }
+    // accept the resume, then ack everything the client could have sent —
+    // this trims the replay buffer and must unstick the sender
+    srv2.send(hello(b"s1", b"t1", 0, false)).await.unwrap();
+    srv2.send(Frame {
+        stream_id: 0,
+        seq: 0,
+        kind: Some(frame::Kind::Ack(Ack {
+            last_seq: 1_000_000,
+        })),
+    })
+    .await
+    .unwrap();
+
+    // the stuck send must now resolve and progress must resume
+    let resumed = tokio::time::timeout(Duration::from_secs(2), progress_rx.recv())
+        .await
+        .expect("send must unstick after the resume ack")
+        .expect("progress channel still open");
+    assert!(
+        resumed > last_seen.expect("checked above"),
+        "progress must have advanced past the stall point"
+    );
+
+    sender.abort();
+}

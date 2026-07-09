@@ -48,6 +48,34 @@ async fn unauthenticated_without_token() {
     assert_eq!(err.message(), "token required");
 }
 
+/// The rejection path must percent-encode grpc-message (tonic decodes it on
+/// the client): a '%' in the auth error text has to survive the round trip.
+#[tokio::test]
+async fn rejection_message_with_percent_survives() {
+    let auth: AuthFn<String> = Arc::new(|_headers, _uri| {
+        Box::pin(async { Err(AuthError::unauthenticated("quota 100% used")) })
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let routes = tonic::service::Routes::new(
+            slozhn_proto::testing::v1::echo_server::EchoServer::new(echo_ws::EchoImpl),
+        );
+        let secured = AuthLayer::new(auth).layer(routes);
+        let app = axum::Router::new().route("/rpc", slozhn::server::grpc_ws(secured));
+        let _ = axum::serve(listener, app).await;
+    });
+
+    let channel = slozhn::client::builder(format!("ws://{addr}/rpc")).build();
+    let mut client = EchoClient::new(channel);
+    let err = client
+        .unary(Request::new(Msg { payload: Bytes::from_static(b"x") }))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), tonic::Code::Unauthenticated);
+    assert_eq!(err.message(), "quota 100% used");
+}
+
 #[tokio::test]
 async fn bearer_token_passes() {
     let (addr, _srv) = start_auth_server().await;

@@ -25,11 +25,13 @@ tracing = "0.1"
 pin-project-lite = "0.2"
 futures-timer = { version = "3", features = ["wasm-bindgen"] }
 fastrand = "2"
+metrics = "0.24"
 opentelemetry = { version = "0.32", optional = true }
 tracing-opentelemetry = { version = "0.33", optional = true }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 uuid = { version = "1", features = ["v4"] }
+tokio = { workspace = true, features = ["sync"] }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 uuid = { version = "1", features = ["v4", "js"] }
@@ -37,4 +39,5 @@ uuid = { version = "1", features = ["v4", "js"] }
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
 tracing-subscriber = "0.3"
-opentelemetry_sdk = "0.32"
+opentelemetry_sdk = { version = "0.32", features = ["testing"] }
+metrics-util = "0.19"

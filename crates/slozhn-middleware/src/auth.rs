@@ -97,15 +97,15 @@ impl<S: Clone, I> Clone for AuthService<S, I> {
 
 fn rejection(e: &AuthError) -> http::Response<TonicBody> {
     let mut resp = http::Response::new(TonicBody::default());
-    let headers = resp.headers_mut();
-    headers.insert("content-type", "application/grpc".parse().expect("static"));
-    headers.insert(
-        "grpc-status",
-        e.code.to_string().parse().expect("numeric status"),
+    resp.headers_mut().insert(
+        "content-type",
+        http::header::HeaderValue::from_static("application/grpc"),
     );
-    if let Ok(v) = http::header::HeaderValue::from_str(&e.message) {
-        headers.insert("grpc-message", v);
-    }
+    // tonic percent-encodes grpc-message per the gRPC spec; hand-rolled
+    // headers would be percent-DECODED by the receiving stub and mangle
+    // any message containing '%'.
+    let status = tonic::Status::new(tonic::Code::from(e.code as i32), e.message.clone());
+    let _ = status.add_header(resp.headers_mut());
     resp
 }
 
@@ -130,7 +130,10 @@ where
     }
 
     fn call(&mut self, mut req: http::Request<TonicBody>) -> Self::Future {
-        let mut inner = self.inner.clone();
+        // keep the service that was actually poll_ready'ed; hand the fresh
+        // clone to self so reserved readiness (permits etc.) isn't leaked
+        let clone = self.inner.clone();
+        let mut inner = std::mem::replace(&mut self.inner, clone);
         let auth = (self.f)(req.headers(), req.uri());
         Box::pin(async move {
             match auth.await {
@@ -140,6 +143,8 @@ where
                 }
                 Err(e) => {
                     tracing::warn!(code = e.code, message = %e.message, "rpc rejected by auth");
+                    metrics::counter!("slozhn_auth_rejected_total", "code" => e.code.to_string())
+                        .increment(1);
                     Ok(rejection(&e))
                 }
             }
@@ -255,7 +260,8 @@ mod tests {
         let mut svc = AuthLayer::new(token_auth()).layer(identity_probe());
         let resp = svc.ready().await.unwrap().call(empty_req()).await.unwrap();
         assert_eq!(resp.headers().get("grpc-status").unwrap(), "16");
-        assert_eq!(resp.headers().get("grpc-message").unwrap(), "missing token");
+        // wire format is percent-encoded (gRPC spec); the client stub decodes
+        assert_eq!(resp.headers().get("grpc-message").unwrap(), "missing%20token");
     }
 
     #[tokio::test]

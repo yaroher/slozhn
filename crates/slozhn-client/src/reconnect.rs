@@ -220,9 +220,12 @@ impl AutoChannel {
                     let ch = Channel::new(conn.clone(), self.spawner.clone());
                     state.current = Some((conn, ch.clone()));
                     self.hooks.set(ConnState::Connected);
+                    metrics::counter!("slozhn_reconnects_total", "outcome" => "ok").increment(1);
                     return ch;
                 }
                 Err(_) => {
+                    metrics::counter!("slozhn_reconnects_total", "outcome" => "fail")
+                        .increment(1);
                     attempt += 1;
                     let delay = slozhn_frame::transport::jittered(base);
                     self.hooks.set(ConnState::Backoff { delay, attempt });

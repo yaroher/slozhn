@@ -14,7 +14,7 @@ use std::collections::VecDeque;
 use std::fmt::Write as _;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::task::{Context, Poll};
+use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -108,6 +108,8 @@ pub async fn connect_session_hooked(
         session_log_id,
         token: peer.resume_token.clone(),
         pending_out: VecDeque::new(),
+        inbound: VecDeque::new(),
+        ready_waker: None,
         ack_timer: None,
         ack_delay: session_config.ack_delay,
         ka_timer: session_config
@@ -165,6 +167,19 @@ pub struct SessionTransport {
     session_log_id: String,
     token: Bytes,
     pending_out: VecDeque<Frame>,
+    /// Frames delivered by `drive()` (Active phase, `Ingress::Deliver`) that
+    /// are waiting to go upward through `Stream::poll_next`. `drive()` is
+    /// also invoked from `poll_ready`/`poll_flush` so the reconnect/ack/
+    /// keepalive machinery keeps moving even while the Sink side is blocked
+    /// on a full replay buffer — without this queue those frames would have
+    /// nowhere to go but a `poll_next` call. Bounded in practice by the
+    /// frame-level flow-control windows upstream, which cap how much can be
+    /// in flight before the receiver stops sending.
+    inbound: VecDeque<Frame>,
+    /// Waker for a `poll_ready` call parked because the replay buffer is
+    /// over its backpressure threshold; woken whenever the buffer might have
+    /// shrunk (Ack processed, resume replay trim) or the transport died.
+    ready_waker: Option<Waker>,
     ack_timer: Option<futures_timer::Delay>,
     ack_delay: Duration,
     /// Physical keepalive (Active phase): armed to interval, then to timeout
@@ -228,16 +243,35 @@ impl SessionTransport {
         self.hooks.set(ConnState::Connecting);
         self.phase = Phase::Connecting((self.factory)());
     }
-}
 
-impl Stream for SessionTransport {
-    type Item = Frame;
+    /// Wake a `poll_ready` parked on backpressure. Called at every point the
+    /// replay buffer might have shrunk (Ack processed, resume replay trim)
+    /// or the transport has died; harmless to call spuriously since
+    /// `poll_ready` just re-checks and re-parks if still over threshold.
+    fn wake_ready(&mut self) {
+        if let Some(w) = self.ready_waker.take() {
+            w.wake();
+        }
+    }
 
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Frame>> {
-        let this = &mut *self;
+    /// Drive the phase state machine one step: reconnect/backoff/resume
+    /// transitions, keepalive timers, flushing `pending_out`, and reading
+    /// frames off the current physical transport. Frames that must be
+    /// delivered upward (Active phase, `Ingress::Deliver`) are pushed to
+    /// `self.inbound` rather than returned directly, so this can be called
+    /// from `poll_next`, `poll_ready`, and `poll_flush` alike without any of
+    /// them needing to "own" frame delivery.
+    ///
+    /// Returns `Poll::Ready(())` only once the transport has reached
+    /// `Phase::Dead` (session over, for good); otherwise `Poll::Pending`
+    /// once the underlying transport/timers have nothing more to offer this
+    /// tick (the current `cx` is already registered on whatever we're
+    /// waiting for).
+    fn drive(&mut self, cx: &mut Context<'_>) -> Poll<()> {
+        let this = self;
         loop {
             match &mut this.phase {
-                Phase::Dead => return Poll::Ready(None),
+                Phase::Dead => return Poll::Ready(()),
 
                 Phase::Backoff(delay) => {
                     if this.kick_wait.is_none() {
@@ -313,9 +347,11 @@ impl Stream for SessionTransport {
                                         session_id = %this.session_log_id,
                                         "session resume rejected by server"
                                     );
+                                    metrics::counter!("slozhn_session_resume_total", "outcome" => "rejected").increment(1);
                                     this.hooks.set(ConnState::Disconnected);
                                     this.phase = Phase::Dead;
-                                    return Poll::Ready(None);
+                                    this.wake_ready();
+                                    return Poll::Ready(());
                                 }
                                 this.backoff_cur = this.backoff_start;
                                 this.attempt = 0;
@@ -327,6 +363,7 @@ impl Stream for SessionTransport {
                                     replay_frames = replay.len(),
                                     "session resume accepted",
                                 );
+                                metrics::counter!("slozhn_session_resume_total", "outcome" => "ok").increment(1);
                                 this.pending_out.extend(replay);
                                 let Phase::Resuming(t) =
                                     std::mem::replace(&mut this.phase, Phase::Dead)
@@ -337,6 +374,9 @@ impl Stream for SessionTransport {
                                 this.ka_timer =
                                     this.keepalive_interval.map(futures_timer::Delay::new);
                                 this.phase = Phase::Active(t);
+                                // resume replay trimmed the buffer to what the
+                                // peer already acked — room may have freed up
+                                this.wake_ready();
                             }
                             _ => {
                                 // garbage before Hello — protocol filth
@@ -344,9 +384,11 @@ impl Stream for SessionTransport {
                                     session_id = %this.session_log_id,
                                     "session resume received non-hello frame"
                                 );
+                                metrics::counter!("slozhn_session_resume_total", "outcome" => "error").increment(1);
                                 this.hooks.set(ConnState::Disconnected);
                                 this.phase = Phase::Dead;
-                                return Poll::Ready(None);
+                                this.wake_ready();
+                                return Poll::Ready(());
                             }
                         },
                         Poll::Ready(None) => this.go_reconnect(),
@@ -430,9 +472,20 @@ impl Stream for SessionTransport {
                                             let _ = Pin::new(d).poll(cx);
                                         }
                                     }
-                                    return Poll::Ready(Some(f));
+                                    // deliver upward via the inbound queue rather
+                                    // than returning directly — poll_next drains
+                                    // it, but poll_ready/poll_flush can also
+                                    // drive this far without losing the frame
+                                    this.inbound.push_back(f);
+                                    continue;
                                 }
-                                Ingress::Consumed => continue,
+                                Ingress::Consumed => {
+                                    // may have been an Ack that trimmed the
+                                    // replay buffer — a parked poll_ready
+                                    // might now have room
+                                    this.wake_ready();
+                                    continue;
+                                }
                             }
                         }
                         Poll::Ready(None) => {
@@ -447,12 +500,53 @@ impl Stream for SessionTransport {
     }
 }
 
+impl Stream for SessionTransport {
+    type Item = Frame;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Frame>> {
+        let this = &mut *self;
+        // drain anything already queued before driving further, so a
+        // pending drive() (e.g. underlying transport has nothing more right
+        // now) doesn't hide frames we already have in hand
+        if let Some(f) = this.inbound.pop_front() {
+            return Poll::Ready(Some(f));
+        }
+        let drove = this.drive(cx);
+        if let Some(f) = this.inbound.pop_front() {
+            return Poll::Ready(Some(f));
+        }
+        match drove {
+            Poll::Pending => Poll::Pending,
+            // drive() only resolves Ready(()) once Phase::Dead is reached
+            Poll::Ready(()) => Poll::Ready(None),
+        }
+    }
+}
+
 impl Sink<Frame> for SessionTransport {
     type Error = TransportClosed;
 
-    fn poll_ready(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        // Simple v1: the volume limit comes from the replay buffer —
-        // its overflow honestly kills the session (spec §8).
+    fn poll_ready(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        let this = &mut *self;
+        if matches!(this.phase, Phase::Dead) {
+            return Poll::Ready(Err(TransportClosed));
+        }
+        // drive the reconnect/keepalive/ack machinery and ingress processing
+        // even though the caller only wants to send — this is what keeps a
+        // caller blocked here from deadlocking the reconnect state machine,
+        // which otherwise only advances from poll_next.
+        let _ = this.drive(cx);
+        if matches!(this.phase, Phase::Dead) {
+            this.ready_waker = None;
+            return Poll::Ready(Err(TransportClosed));
+        }
+        let (bytes, cap) = this.core.buffer_usage();
+        // backpressure at 80% of the replay buffer cap, instead of racing
+        // start_send into BufferOverflow and killing the session
+        if cap > 0 && bytes.saturating_mul(10) > cap.saturating_mul(8) {
+            this.ready_waker = Some(cx.waker().clone());
+            return Poll::Pending;
+        }
         Poll::Ready(Ok(()))
     }
 
@@ -476,6 +570,7 @@ impl Sink<Frame> for SessionTransport {
                     "session replay buffer overflow; closing logical session"
                 );
                 this.phase = Phase::Dead;
+                this.wake_ready();
                 Err(TransportClosed)
             }
         }
@@ -483,6 +578,10 @@ impl Sink<Frame> for SessionTransport {
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         let this = &mut *self;
+        // drive the state machine here too, so a caller doing
+        // send().await (poll_ready -> start_send -> poll_flush) keeps the
+        // reconnect/ack/keepalive machinery moving through every step.
+        let _ = this.drive(cx);
         if let Phase::Active(t) = &mut this.phase
             && matches!(
                 Self::try_flush(t, &mut this.pending_out, cx),

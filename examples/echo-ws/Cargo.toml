@@ -8,7 +8,9 @@ edition.workspace = true
 slozhn = { path = "../../crates/slozhn", features = ["client", "server", "middleware"] }
 slozhn-client = { path = "../../crates/slozhn-client" }
 slozhn-proto = { path = "../../crates/slozhn-proto" }
-tonic = { version = "0.14", default-features = false, features = ["codegen", "router"] }
+tonic = { version = "0.14", default-features = false, features = ["codegen", "router", "gzip", "server", "channel"] }
+tonic-reflection = "0.14.6"
+tonic-health = "0.14.6"
 axum = { version = "0.8", default-features = false, features = ["ws", "http1", "tokio"] }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "net", "io-util"] }
 tokio-stream = "0.1"

@@ -54,6 +54,13 @@ impl SessionCore {
         self.last_recv_seq
     }
 
+    /// Current replay buffer occupancy: `(bytes_used, cap_bytes)`. Used by
+    /// the client transport to apply Sink backpressure before hitting
+    /// `BufferOverflow`.
+    pub fn buffer_usage(&self) -> (usize, usize) {
+        (self.buffer_bytes, self.cap_bytes)
+    }
+
     /// Outgoing frame: stamp seq + replay buffer. Overflow = session death.
     pub fn on_egress(&mut self, mut f: Frame) -> Result<Frame, SessionError> {
         if !sessioned(&f) {

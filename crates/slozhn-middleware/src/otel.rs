@@ -42,7 +42,10 @@ pub(crate) fn extract_parent(span: &tracing::Span, headers: &http::HeaderMap) {
     let parent = opentelemetry::global::get_text_map_propagator(|prop| {
         prop.extract(&HeaderExtractor(headers))
     });
-    span.set_parent(parent);
+    if let Err(e) = span.set_parent(parent) {
+        // span already closed / not sampled — nothing to attach the parent to
+        tracing::debug!(error = %e, "failed to set otel parent context");
+    }
 }
 
 #[cfg(test)]

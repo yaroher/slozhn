@@ -75,4 +75,6 @@ pub enum OpenError {
     GoingAway,
     #[error("connection closed: {0}")]
     Connection(String),
+    #[error("per-connection stream limit exceeded")]
+    LimitExceeded,
 }

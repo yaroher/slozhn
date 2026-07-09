@@ -425,6 +425,7 @@ async fn send_blocks_without_window_and_resumes_on_read() {
     let cfg = Config {
         initial_stream_window: 16,
         initial_connection_window: 1024,
+        ..Default::default()
     };
     let (a, b) = loopback::pair();
     let (client, cd) = bind(Side::Client, cfg.clone(), a);
@@ -473,6 +474,7 @@ async fn connection_window_caps_across_streams() {
     let cfg = Config {
         initial_stream_window: 1024,
         initial_connection_window: 16,
+        ..Default::default()
     };
     let (a, b) = loopback::pair();
     let (client, cd) = bind(Side::Client, cfg.clone(), a);
@@ -624,4 +626,95 @@ async fn version_mismatch_kills_connection() {
             slozhn_frame::error::ProtocolError::VersionMismatch(99)
         )
     ));
+}
+
+#[tokio::test]
+async fn stream_limit_rejects_inbound_open() {
+    use slozhn_frame::ext::{MetadataExt, StatusExt};
+    use slozhn_frame::proto::v1::{Metadata, Status};
+    use slozhn_frame::stream::StreamEvent;
+
+    let server_cfg = Config {
+        max_streams: 2,
+        ..Default::default()
+    };
+    let (a, b) = loopback::pair();
+    let (client, cd) = bind(Side::Client, Config::default(), a);
+    let (server, sd) = bind(Side::Server, server_cfg, b);
+    tokio::spawn(cd.run());
+    tokio::spawn(sd.run());
+    let _keep = (client.clone(), server.clone());
+
+    let (_send1, _recv1) = client
+        .open("/svc.S/One".into(), Metadata::empty())
+        .await
+        .unwrap();
+    let (_send2, _recv2) = client
+        .open("/svc.S/Two".into(), Metadata::empty())
+        .await
+        .unwrap();
+    let inc1 = server.accept().await.expect("incoming 1");
+    let _inc2 = server.accept().await.expect("incoming 2");
+
+    // the server's max_streams is 2, already at capacity — the third open
+    // must be rejected with a stream-level RESOURCE_EXHAUSTED status
+    let (_send3, mut recv3) = client
+        .open("/svc.S/Three".into(), Metadata::empty())
+        .await
+        .unwrap();
+    let terminal = recv3.next_event().await.expect("event");
+    assert!(matches!(terminal, StreamEvent::Terminated(s) if s.code == 8));
+    // the rejected stream never reaches the accept queue
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(50), server.accept())
+            .await
+            .is_err()
+    );
+
+    // free a slot: the accepting side finishes stream 1 — this synchronously
+    // removes it from the server's stream map before the ack completes
+    inc1.send.finish(Status::ok()).await.unwrap();
+
+    // a new open now succeeds
+    let (_send4, mut recv4) = client
+        .open("/svc.S/Four".into(), Metadata::empty())
+        .await
+        .unwrap();
+    let inc4 = server.accept().await.expect("incoming 4");
+    inc4.send.send_headers(Metadata::empty()).unwrap();
+    assert!(matches!(
+        recv4.next_event().await,
+        Some(StreamEvent::Headers(_))
+    ));
+}
+
+#[tokio::test]
+async fn local_open_respects_stream_limit() {
+    use slozhn_frame::error::OpenError;
+    use slozhn_frame::ext::MetadataExt;
+    use slozhn_frame::proto::v1::Metadata;
+
+    let client_cfg = Config {
+        max_streams: 1,
+        ..Default::default()
+    };
+    let (a, b) = loopback::pair();
+    let (client, cd) = bind(Side::Client, client_cfg, a);
+    let (server, sd) = bind(Side::Server, Config::default(), b);
+    tokio::spawn(cd.run());
+    tokio::spawn(sd.run());
+    let _keep = (client.clone(), server.clone());
+
+    // first open consumes the client's only stream slot
+    let (_send1, _recv1) = client
+        .open("/svc.S/One".into(), Metadata::empty())
+        .await
+        .unwrap();
+
+    // second open is rejected locally without ever hitting the wire
+    match client.open("/svc.S/Two".into(), Metadata::empty()).await {
+        Err(OpenError::LimitExceeded) => {}
+        Ok(_) => panic!("expected LimitExceeded, got Ok"),
+        Err(other) => panic!("expected LimitExceeded, got {other:?}"),
+    }
 }

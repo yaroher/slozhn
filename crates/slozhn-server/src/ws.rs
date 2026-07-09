@@ -50,6 +50,8 @@ impl ConnectionRegistry {
             let id = state.next_id;
             state.next_id += 1;
             state.connections.insert(id, conn.clone());
+            metrics::gauge!("slozhn_ws_connections_active")
+                .set(state.connections.len() as f64);
             (id, state.draining)
         };
         tracing::debug!(
@@ -129,13 +131,15 @@ struct ConnectionRegistration {
 
 impl Drop for ConnectionRegistration {
     fn drop(&mut self) {
-        self.registry
+        let mut state = self
+            .registry
             .inner
             .state
             .lock()
-            .expect("connection registry lock")
-            .connections
-            .remove(&self.id);
+            .expect("connection registry lock");
+        state.connections.remove(&self.id);
+        metrics::gauge!("slozhn_ws_connections_active").set(state.connections.len() as f64);
+        drop(state);
         tracing::debug!(
             registry_connection_id = self.id,
             "unregistered server ws connection"

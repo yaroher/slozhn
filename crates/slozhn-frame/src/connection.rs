@@ -27,6 +27,14 @@ pub struct Config {
     pub initial_stream_window: u32,
     /// Our connection recv window (announced in Hello).
     pub initial_connection_window: u32,
+    /// Maximum number of concurrently open streams per connection, counting
+    /// both directions (locally opened + peer-opened). Protects against a
+    /// peer (or a runaway local caller) exhausting memory by opening an
+    /// unbounded number of streams. Inbound `Open` frames beyond the limit
+    /// are rejected with a stream-level `Status` (code 8,
+    /// RESOURCE_EXHAUSTED); local `Command::Open` beyond the limit fails
+    /// with `OpenError::LimitExceeded`.
+    pub max_streams: usize,
 }
 
 impl Default for Config {
@@ -34,6 +42,7 @@ impl Default for Config {
         Self {
             initial_stream_window: DEFAULT_WINDOW,
             initial_connection_window: DEFAULT_WINDOW,
+            max_streams: 1024,
         }
     }
 }
@@ -559,6 +568,8 @@ struct Actor {
     highest_remote_open: u64,
     /// BTreeMap — deterministic iteration order when distributing window.
     streams: BTreeMap<u64, StreamSlot>,
+    /// Maximum concurrently open streams (both directions) — DoS guard.
+    max_streams: usize,
     /// Streams recently closed by us: frames in flight are a legal race.
     reset_ids: HashSet<u64>,
     reset_order: VecDeque<u64>,
@@ -594,6 +605,7 @@ impl Actor {
             going_away_remote: false,
             highest_remote_open: 0,
             streams: BTreeMap::new(),
+            max_streams: config.max_streams,
             reset_ids: HashSet::new(),
             reset_order: VecDeque::new(),
             conn_send_window: Window::new(peer_hello.initial_connection_window),
@@ -606,8 +618,10 @@ impl Actor {
         }
     }
 
-    fn remove_slot(&mut self, stream_id: u64) {
-        self.streams.remove(&stream_id);
+    /// Remember `stream_id` as recently closed so in-flight follow-up frames
+    /// (a legal race) are dropped silently instead of causing a protocol
+    /// error.
+    fn mark_reset(&mut self, stream_id: u64) {
         if self.reset_ids.insert(stream_id) {
             self.reset_order.push_back(stream_id);
             if self.reset_order.len() > RESET_IDS_CAP
@@ -616,6 +630,11 @@ impl Actor {
                 self.reset_ids.remove(&old);
             }
         }
+    }
+
+    fn remove_slot(&mut self, stream_id: u64) {
+        self.streams.remove(&stream_id);
+        self.mark_reset(stream_id);
         self.close_accept_if_drained();
     }
 
@@ -654,6 +673,17 @@ impl Actor {
                         "rejecting open on going-away connection",
                     );
                     let _ = reply.send(Err(OpenError::GoingAway));
+                    return vec![];
+                }
+                if self.streams.len() >= self.max_streams {
+                    tracing::warn!(
+                        connection_id = self.connection_id,
+                        side = ?self.side,
+                        method,
+                        max_streams = self.max_streams,
+                        "rejecting local open: stream limit exceeded",
+                    );
+                    let _ = reply.send(Err(OpenError::LimitExceeded));
                     return vec![];
                 }
                 let Some(cmd_tx) = self.cmd_tx.upgrade() else {
@@ -1000,6 +1030,24 @@ impl Actor {
             return Ok(vec![stream_frame(
                 stream_id,
                 frame::Kind::Cancel(crate::proto::v1::Cancel {}),
+            )]);
+        }
+        if self.streams.len() >= self.max_streams {
+            tracing::warn!(
+                connection_id = self.connection_id,
+                side = ?self.side,
+                stream_id,
+                max_streams = self.max_streams,
+                "rejecting peer open: stream limit exceeded",
+            );
+            self.mark_reset(stream_id);
+            return Ok(vec![stream_frame(
+                stream_id,
+                frame::Kind::Status(Status {
+                    code: 8, // RESOURCE_EXHAUSTED
+                    message: "stream limit exceeded".into(),
+                    trailers: Some(Metadata { entries: Vec::new() }),
+                }),
             )]);
         }
         self.highest_remote_open = self.highest_remote_open.max(stream_id);

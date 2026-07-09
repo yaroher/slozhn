@@ -322,7 +322,9 @@ where
     }
 
     fn call(&mut self, req: http::Request<TonicBody>) -> Self::Future {
-        let mut inner = self.inner.clone();
+        // keep the poll_ready'ed instance, park the fresh clone in self
+        let clone = self.inner.clone();
+        let mut inner = std::mem::replace(&mut self.inner, clone);
         let config = self.config.clone();
         Box::pin(async move {
             let method = request_method(&req);
@@ -398,9 +400,13 @@ where
                 match inner.call(req).await {
                     Ok(resp) if is_unavailable(&resp) && attempt < config.max_attempts => {
                         tracing::info!(%method, attempt, "retrying after UNAVAILABLE");
+                        metrics::counter!("slozhn_retries_total", "method" => method.clone())
+                            .increment(1);
                     }
                     Err(_e) if attempt < config.max_attempts => {
                         tracing::info!(%method, attempt, "retrying after transport error");
+                        metrics::counter!("slozhn_retries_total", "method" => method.clone())
+                            .increment(1);
                     }
                     other => return other,
                 }

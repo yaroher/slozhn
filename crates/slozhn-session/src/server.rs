@@ -25,6 +25,11 @@ pub struct ServerSessionConfig {
     pub frame: slozhn_frame::connection::Config,
     /// How long to wait for the client to return after a disconnect.
     pub ttl: Duration,
+    /// Max number of concurrent sessions this manager will hold. New-session
+    /// requests beyond the limit are rejected honestly (resume_rejected Hello)
+    /// instead of accepted and later starved; existing sessions' resumes are
+    /// never blocked by this limit.
+    pub max_sessions: usize,
 }
 
 impl Default for ServerSessionConfig {
@@ -33,6 +38,7 @@ impl Default for ServerSessionConfig {
             session: SessionConfig::default(),
             frame: slozhn_frame::connection::Config::default(),
             ttl: Duration::from_secs(60),
+            max_sessions: 10_000,
         }
     }
 }
@@ -63,6 +69,11 @@ impl SessionManager {
             sessions: Arc::new(Mutex::new(HashMap::new())),
             config,
         })
+    }
+
+    /// Number of currently live sessions (read-only metrics surface).
+    pub fn session_count(&self) -> usize {
+        self.sessions.lock().expect("registry lock").len()
     }
 
     /// Handle a new physical connection.
@@ -96,7 +107,26 @@ impl SessionManager {
         }
 
         if hello.session_id.is_empty() {
-            // new session
+            // new session — enforce the concurrent session cap first
+            let current = self.sessions.lock().expect("registry lock").len();
+            if current >= self.config.max_sessions {
+                tracing::warn!(
+                    current_sessions = current,
+                    max_sessions = self.config.max_sessions,
+                    "server session limit reached; rejecting new session",
+                );
+                metrics::counter!("slozhn_sessions_rejected_total").increment(1);
+                let _ = transport
+                    .send(server_hello(
+                        &self.config.frame,
+                        &Bytes::new(),
+                        &Bytes::new(),
+                        0,
+                        true,
+                    ))
+                    .await;
+                return Ok(None);
+            }
             let session_id = Bytes::copy_from_slice(uuid::Uuid::new_v4().as_bytes());
             let session_log_id = session_label(&session_id);
             let token = Bytes::copy_from_slice(uuid::Uuid::new_v4().as_bytes());
@@ -107,13 +137,18 @@ impl SessionManager {
             })?;
 
             let (attach_tx, attach_rx) = mpsc::unbounded_channel();
-            self.sessions.lock().expect("registry lock").insert(
-                session_id.clone(),
-                SessionEntry {
-                    token: token.clone(),
-                    attach_tx,
-                },
-            );
+            {
+                let mut sessions = self.sessions.lock().expect("registry lock");
+                sessions.insert(
+                    session_id.clone(),
+                    SessionEntry {
+                        token: token.clone(),
+                        attach_tx,
+                    },
+                );
+                // absolute value, not inc/dec — immune to drift on double removal
+                metrics::gauge!("slozhn_sessions_active").set(sessions.len() as f64);
+            }
             tracing::info!(
                 session_id = %session_log_id,
                 ttl_ms = self.config.ttl.as_millis(),
@@ -285,10 +320,11 @@ impl ServerSessionTransport {
             session_id = %self.session_log_id,
             "server session expired or closed",
         );
-        self.registry
-            .lock()
-            .expect("registry lock")
-            .remove(&self.session_id);
+        {
+            let mut sessions = self.registry.lock().expect("registry lock");
+            sessions.remove(&self.session_id);
+            metrics::gauge!("slozhn_sessions_active").set(sessions.len() as f64);
+        }
         self.phase = SPhase::Dead;
     }
 
@@ -317,10 +353,9 @@ impl ServerSessionTransport {
 
 impl Drop for ServerSessionTransport {
     fn drop(&mut self) {
-        self.registry
-            .lock()
-            .expect("registry lock")
-            .remove(&self.session_id);
+        let mut sessions = self.registry.lock().expect("registry lock");
+        sessions.remove(&self.session_id);
+        metrics::gauge!("slozhn_sessions_active").set(sessions.len() as f64);
     }
 }
 

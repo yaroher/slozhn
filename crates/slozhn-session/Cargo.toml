@@ -7,6 +7,7 @@ repository.workspace = true
 description = "Resume layer for slozhn: seq/ack/replay, streams survive reconnects"
 
 [dependencies]
+metrics = "0.24"
 slozhn-frame = { path = "../slozhn-frame", version = "1.0.3" }
 prost.workspace = true
 bytes.workspace = true

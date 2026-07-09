@@ -2,7 +2,10 @@
 //! (primarily `tonic::service::Routes` — tonic's whole middleware stack
 //! works as is). Native-only (spec §6): uses `tokio::spawn`.
 
+mod proxy;
 pub mod ws;
+
+pub use proxy::{GrpcProxy, grpc_proxy};
 
 use http_body_util::BodyExt;
 use slozhn_frame::ext::StatusExt;
