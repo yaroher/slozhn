@@ -496,6 +496,39 @@ let mut client = EchoClient::new(channel)
     .accept_compressed(tonic::codec::CompressionEncoding::Gzip);
 ```
 
+### Validation
+
+`ValidateLayer` checks request messages against protoc-gen-validate rules
+BEFORE the handler runs — every message of every streaming shape, on the
+server (inbound) or on the client (outbound, fail-fast). With the `validate`
+feature, one line covers all methods of all services via descriptors — no
+per-method registration:
+
+```rust
+let v = slozhn::middleware::ValidateLayer::from_descriptor_sets([
+    my_proto::validate::FILE_DESCRIPTOR_SET,   // dependencies first
+    my_proto::shop::v1::FILE_DESCRIPTOR_SET,
+])?
+// the caster owns the response entirely — code, message, details:
+.caster(|method, violations: Vec<prost_validate::Error>| {
+    let domain = my_domain_error(&violations);         // your error proto
+    tonic::Status::with_details(
+        Code::InvalidArgument,
+        "validation failed",
+        domain.encode_to_vec().into(),                 // → grpc-status-details-bin
+    )
+});
+Router::new().route("/rpc", slozhn::server::grpc_ws(v.layer(routes)));
+```
+
+Overrides on top of the reflective default: `.message::<M>(path)` uses `M`'s
+derived `prost_validate::Validator` (no reflection, ~10× faster — for hot
+methods), `.method(path, |m: &M| ...)` for rules PGV can't express (no
+optional dependencies needed). Compressed messages are not validated;
+malformed protobuf is left to the tonic codec. `prost-validate` is
+fail-fast today, so the caster receives one violation per failing message —
+the `Vec` signature is ready for a validate-all upstream.
+
 ### Rate limiting
 
 `RateLimitLayer` (server, non-wasm) enforces GCRA quotas — precise sustained

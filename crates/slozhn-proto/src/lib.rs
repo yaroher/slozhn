@@ -15,3 +15,9 @@ pub mod testing {
         // @@protoc_insertion_point(testing.v1)
     }
 }
+#[cfg(feature = "validate")]
+// @@protoc_insertion_point(attribute:validate)
+pub mod validate {
+    include!("validate/validate.rs");
+    // @@protoc_insertion_point(validate)
+}

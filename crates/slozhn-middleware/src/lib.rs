@@ -16,6 +16,10 @@
 //!   response instead of re-executing the handler.
 //! - [`TimeoutLayer`] — client-side per-call deadline; sets `grpc-timeout`
 //!   for the server and races the call locally, canceling it on expiry.
+//! - [`ValidateLayer`] — PGV message validation before the handler:
+//!   zero-registration via descriptors (`validate` feature), typed and
+//!   manual overrides; a user caster turns violations into the response
+//!   (domain error details included).
 //! - [`RateLimitLayer`] (server, non-wasm) — GCRA rate limiting per
 //!   method × caller key, pluggable store ([`RateLimitStore`]) for shared
 //!   limits behind a load balancer; over-limit calls get
@@ -52,6 +56,7 @@ mod metrics;
 mod retry;
 mod timeout;
 mod trace;
+mod validate;
 
 #[cfg(not(target_arch = "wasm32"))]
 mod deadline;
@@ -86,3 +91,4 @@ pub use rate_limit::{
 pub use retry::{RetryLayer, RetryPolicy, RetryService};
 pub use timeout::{TimeoutError, TimeoutLayer, TimeoutService};
 pub use trace::{ServerTraced, TraceLayer, TraceService, trace_server};
+pub use validate::{ValidateLayer, ValidateService};

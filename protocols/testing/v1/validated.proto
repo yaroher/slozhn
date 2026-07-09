@@ -1,0 +1,26 @@
+syntax = "proto3";
+
+package testing.v1;
+
+import "validate/validate.proto";
+
+// Test service for the validation middleware: PGV rules live in the
+// descriptor options, so the reflection-based ValidateLayer can enforce
+// them with zero per-method registration.
+service Validated {
+  rpc Check(ValidatedRequest) returns (ValidatedReply);
+  rpc CheckStream(stream ValidatedRequest) returns (ValidatedReply);
+}
+
+message ValidatedRequest {
+  // 3..=8 chars — easy to violate from a test.
+  string name = 1 [(validate.rules).string = {min_len: 3, max_len: 8}];
+  // must be positive
+  int64 count = 2 [(validate.rules).int64.gt = 0];
+  // optional, but if present must be a valid email
+  string email = 3 [(validate.rules).string.email = true, (validate.rules).string.ignore_empty = true];
+}
+
+message ValidatedReply {
+  string echo = 1;
+}

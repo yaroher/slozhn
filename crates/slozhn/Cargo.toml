@@ -16,6 +16,8 @@ server = ["dep:slozhn-server"]
 middleware = ["dep:slozhn-middleware"]
 # W3C traceparent propagation in the middleware TraceLayer
 otel = ["middleware", "slozhn-middleware/otel"]
+# PGV message validation (reflection + typed) in the middleware ValidateLayer
+validate = ["middleware", "slozhn-middleware/validate"]
 
 [dependencies]
 slozhn-frame = { path = "../slozhn-frame", version = "1.0.3" }
