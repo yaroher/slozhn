@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use slozhn_client::Spawner;
 use slozhn_client::reconnect::{
-    AutoChannel, AutoConfig, FactoryOutput, KeepaliveConfig, TransportFactory,
+    AutoChannel, AutoConfig, FactoryError, FactoryOutput, KeepaliveConfig, TransportFactory,
 };
 use slozhn_session::SessionConfig;
 
@@ -69,8 +69,10 @@ impl ChannelBuilder {
         self
     }
 
-    /// WS-upgrade header (auth). Native only: the browser WebSocket
-    /// cannot set headers — use query params or cookies.
+    /// WS-upgrade header (auth). Native only: the browser WebSocket cannot
+    /// set headers — use query params or cookies. Compiled out on wasm32,
+    /// so calling it there is a compile error rather than a runtime panic.
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn header(
         mut self,
         name: http::header::HeaderName,
@@ -82,12 +84,6 @@ impl ChannelBuilder {
 
     /// Build the channel. Lazy: the connection comes up on the first call.
     pub fn build(self) -> Channel {
-        #[cfg(target_arch = "wasm32")]
-        assert!(
-            self.headers.is_empty(),
-            "browser WebSocket cannot set headers; use query params or cookies"
-        );
-
         let Self {
             url,
             mut resume,
@@ -118,10 +114,15 @@ impl ChannelBuilder {
             Box::pin(async move {
                 match resume {
                     None => {
-                        let t = raw_transport(&url, &headers).await?;
+                        let t = raw_transport(&url, &headers)
+                            .await
+                            .map_err(FactoryError::connect)?;
                         Ok(FactoryOutput::Raw(t))
                     }
                     Some(session_cfg) => {
+                        // slozhn_session::client::Factory is fixed to
+                        // Result<_, String> — String is preserved verbatim,
+                        // it already carries only WS-connect failures here.
                         let ws_factory: slozhn_session::client::Factory = {
                             let url = url.clone();
                             let headers = headers.clone();
@@ -138,7 +139,7 @@ impl ChannelBuilder {
                             session_hooks.clone(),
                         )
                         .await
-                        .map_err(|e| e.to_string())?;
+                        .map_err(FactoryError::handshake)?;
                         Ok(FactoryOutput::PreNegotiated(Box::pin(t), peer_hello))
                     }
                 }

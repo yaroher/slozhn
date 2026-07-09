@@ -166,11 +166,27 @@ where
 pin_project! {
     /// Response body wrapper: captures the grpc status from the trailers
     /// frame; an end-of-body without any status is reported as an abort.
+    #[project = TracedBodyProj]
     pub struct TracedBody<B> {
         #[pin]
         inner: B,
         span: Span,
         done: bool,
+    }
+
+    impl<B> PinnedDrop for TracedBody<B> {
+        fn drop(this: Pin<&mut Self>) {
+            // If the body is dropped before a terminal status was ever
+            // recorded (e.g. the client cancels the call after headers but
+            // before trailers arrive), `poll_frame`'s terminal arms never
+            // ran and the cancellation would otherwise be silently lost —
+            // mirrors `metrics::InflightGuard`'s Drop-based leak-proofing.
+            let TracedBodyProj { done, span, .. } = this.project();
+            if !*done {
+                *done = true;
+                tracing::warn!(parent: &*span, "rpc cancelled before completion");
+            }
+        }
     }
 }
 
@@ -302,6 +318,73 @@ mod tests {
 
         let events = captured.0.lock().unwrap().join("\n");
         assert!(events.contains("code=0"), "{events}");
+    }
+
+    /// Body that yields one data frame, then stays pending forever — models a
+    /// stream that's dropped before trailers ever arrive.
+    struct OneFrameThenPending(bool);
+
+    impl http_body::Body for OneFrameThenPending {
+        type Data = Bytes;
+        type Error = std::convert::Infallible;
+
+        fn poll_frame(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+            if !self.0 {
+                self.0 = true;
+                Poll::Ready(Some(Ok(Frame::data(Bytes::from_static(b"payload")))))
+            } else {
+                Poll::Pending
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn dropped_before_trailers_emits_cancellation_event() {
+        let captured = Captured::default();
+        let subscriber =
+            tracing_subscriber::registry().with(CaptureLayer(captured.clone()));
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let span = tracing::info_span!("rpc");
+        let mut body = TracedBody { inner: OneFrameThenPending(false), span, done: false };
+        let _ = body.frame().await; // headers only — no trailers frame
+        drop(body);
+
+        let events = captured.0.lock().unwrap().join("\n");
+        assert!(events.contains("rpc cancelled before completion"), "{events}");
+    }
+
+    #[tokio::test]
+    async fn no_double_emit_when_trailers_already_recorded() {
+        let captured = Captured::default();
+        let subscriber =
+            tracing_subscriber::registry().with(CaptureLayer(captured.clone()));
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let svc = tower::service_fn(|_req: http::Request<http_body_util::Full<Bytes>>| async {
+            let mut trailers = http::HeaderMap::new();
+            trailers.insert("grpc-status", "0".parse().unwrap());
+            let body = http_body_util::Full::new(Bytes::from_static(b"payload"))
+                .with_trailers(async move { Some(Ok(trailers)) });
+            Ok::<_, std::convert::Infallible>(http::Response::new(body))
+        });
+        let mut traced = TraceLayer::server().layer(svc);
+
+        let req = http::Request::builder()
+            .uri("/test.Echo/Unary")
+            .body(full_body(b"x"))
+            .unwrap();
+        let resp = traced.ready().await.unwrap().call(req).await.unwrap();
+        let _collected = resp.into_body().collect().await.unwrap();
+        // the TracedBody is fully consumed and dropped by `collect()` above;
+        // having already recorded the trailers status, it must not also
+        // emit a "cancelled" event on drop.
+
+        let events = captured.0.lock().unwrap().join("\n");
+        assert!(!events.contains("cancelled"), "{events}");
     }
 }
 

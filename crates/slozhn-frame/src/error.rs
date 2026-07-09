@@ -1,6 +1,7 @@
 use crate::proto::v1::Status;
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
 pub enum ProtocolError {
     #[error("first frame must be HELLO")]
     ExpectedHello,
@@ -26,9 +27,12 @@ pub enum ProtocolError {
     ConnectionFrameOnStream(u64),
     #[error("stream-level frame kind on stream 0")]
     StreamFrameOnConnection,
+    #[error("peer sent a Message on stream {0} while its receive window was already exhausted")]
+    FlowControlViolation(u64),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum GoAwayCode {
     Graceful = 0,
     ProtocolError = 1,
@@ -50,6 +54,7 @@ impl GoAwayCode {
 pub struct TransportClosed;
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
 pub enum ConnError {
     #[error("protocol violation: {0}")]
     Protocol(#[from] ProtocolError),
@@ -57,9 +62,12 @@ pub enum ConnError {
     PeerGoAway { code: GoAwayCode, message: String },
     #[error(transparent)]
     TransportClosed(#[from] TransportClosed),
+    #[error("peer did not complete the HELLO handshake in time")]
+    HandshakeTimeout,
 }
 
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
+#[non_exhaustive]
 pub enum StreamError {
     #[error("stream terminated with status code {}", .0.code)]
     Status(Status),
@@ -70,6 +78,7 @@ pub enum StreamError {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
 pub enum OpenError {
     #[error("connection is going away")]
     GoingAway,

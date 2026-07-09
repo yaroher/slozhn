@@ -3,6 +3,7 @@ name = "echo-ws"
 version = "0.0.0"
 publish = false
 edition.workspace = true
+rust-version.workspace = true
 
 [dependencies]
 slozhn = { path = "../../crates/slozhn", features = ["client", "server", "middleware", "validate"] }

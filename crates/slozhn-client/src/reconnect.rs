@@ -47,8 +47,43 @@ pub enum FactoryOutput {
     PreNegotiated(BoxFrameTransport, slozhn_frame::proto::v1::Hello),
 }
 
+/// Why the transport factory failed: distinguishes physical connect failure
+/// from session-layer handshake failure without collapsing both into an
+/// opaque string. `Other` preserves errors from turnkey String-returning
+/// integrations (e.g. a user-supplied boxed closure) losslessly.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum FactoryError {
+    /// The underlying transport (e.g. the WebSocket upgrade) never came up.
+    #[error("transport connect failed: {0}")]
+    Connect(String),
+    /// The transport connected but the session-layer handshake (Hello
+    /// exchange, resume negotiation) failed.
+    #[error("session handshake failed: {0}")]
+    Handshake(String),
+    /// Any other factory failure not classified above.
+    #[error("{0}")]
+    Other(String),
+}
+
+impl FactoryError {
+    pub fn connect(error: impl std::fmt::Display) -> Self {
+        Self::Connect(error.to_string())
+    }
+
+    pub fn handshake(error: impl std::fmt::Display) -> Self {
+        Self::Handshake(error.to_string())
+    }
+}
+
+impl From<String> for FactoryError {
+    fn from(s: String) -> Self {
+        Self::Other(s)
+    }
+}
+
 pub type TransportFactory =
-    Arc<dyn Fn() -> BoxFuture<'static, Result<FactoryOutput, String>> + Send + Sync>;
+    Arc<dyn Fn() -> BoxFuture<'static, Result<FactoryOutput, FactoryError>> + Send + Sync>;
 
 #[derive(Clone)]
 pub struct AutoConfig {
@@ -223,7 +258,8 @@ impl AutoChannel {
                     metrics::counter!("slozhn_reconnects_total", "outcome" => "ok").increment(1);
                     return ch;
                 }
-                Err(_) => {
+                Err(error) => {
+                    tracing::debug!(%error, "transport factory failed");
                     metrics::counter!("slozhn_reconnects_total", "outcome" => "fail")
                         .increment(1);
                     attempt += 1;
@@ -315,7 +351,7 @@ mod tests {
     fn failing_factory(calls: Arc<AtomicU32>) -> TransportFactory {
         Arc::new(move || {
             calls.fetch_add(1, Ordering::SeqCst);
-            Box::pin(async { Err("nope".to_string()) })
+            Box::pin(async { Err(FactoryError::Other("nope".to_string())) })
         })
     }
 

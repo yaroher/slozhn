@@ -63,10 +63,15 @@ where
     let resp = match svc.call(req).await {
         Ok(r) => r,
         Err(e) => {
-            let msg = format!("service error: {e}");
+            let msg = format!("{e}");
             drop(e); // S::Error may be !Send — don't carry it across an await
-            tracing::warn!(%method, error = %msg, "slozhn service call failed");
-            let _ = send.finish(Status::with_code(13, &msg)).await;
+            tracing::error!(%method, error = %msg, "slozhn service call failed");
+            // Don't forward the handler error's Display to the peer: it may
+            // contain internal details (paths, connection strings). Keep
+            // the detail server-side only.
+            let _ = send
+                .finish(Status::with_code(13, "internal error"))
+                .await;
             return;
         }
     };

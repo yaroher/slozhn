@@ -9,15 +9,36 @@ use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::routing::{MethodRouter, any};
 use bytes::Bytes;
 use futures::{Sink, Stream, StreamExt};
+use slozhn_frame::MAX_MESSAGE_SIZE;
 use slozhn_frame::codec::framed;
 use slozhn_frame::connection::{Config, bind};
 use slozhn_frame::error::GoAwayCode;
 use slozhn_frame::ids::Side;
 use slozhn_frame::{Connection, TransportClosed};
 
+/// Slack over `slozhn_frame::MAX_MESSAGE_SIZE` for the protobuf envelope
+/// overhead (headers, framing) added on top of the payload.
+const WS_MESSAGE_SIZE_SLACK: usize = 64 * 1024;
+
+/// Cap applied to `WebSocketUpgrade::max_message_size` /
+/// `max_frame_size`: the frame layer rejects anything over
+/// `MAX_MESSAGE_SIZE` on its own, so the WS transport only needs enough
+/// headroom to let that check run instead of ballooning to
+/// tokio-tungstenite's 64 MiB / 16 MiB defaults.
+fn ws_max_size() -> usize {
+    MAX_MESSAGE_SIZE + WS_MESSAGE_SIZE_SLACK
+}
+
+/// Apply the shared WS message/frame size caps to an upgrade.
+fn capped(ws: WebSocketUpgrade) -> WebSocketUpgrade {
+    let max = ws_max_size();
+    ws.max_message_size(max).max_frame_size(max)
+}
+
 #[derive(Default)]
 struct RegistryInner {
     state: Mutex<RegistryState>,
+    max_connections: Option<usize>,
 }
 
 #[derive(Default)]
@@ -44,9 +65,34 @@ impl ConnectionRegistry {
         Self::default()
     }
 
-    fn register(&self, conn: Connection) -> ConnectionRegistration {
+    /// Reject new connections once `max` are concurrently registered.
+    /// Connections already accepted before the cap was reached are never
+    /// evicted — only [`Self::register`] enforces the limit.
+    pub fn with_max_connections(max: usize) -> Self {
+        Self {
+            inner: Arc::new(RegistryInner {
+                state: Mutex::default(),
+                max_connections: Some(max),
+            }),
+        }
+    }
+
+    /// Register a freshly bound connection. Returns `None` (without
+    /// inserting anything — no slot is leaked) when the registry is at
+    /// capacity; the caller must reject the connection.
+    fn register(&self, conn: Connection) -> Option<ConnectionRegistration> {
         let (id, draining) = {
             let mut state = self.inner.state.lock().expect("connection registry lock");
+            if let Some(max) = self.inner.max_connections
+                && state.connections.len() >= max
+            {
+                tracing::warn!(
+                    frame_connection_id = conn.id(),
+                    max_connections = max,
+                    "rejecting server ws connection: registry at capacity"
+                );
+                return None;
+            }
             let id = state.next_id;
             state.next_id += 1;
             state.connections.insert(id, conn.clone());
@@ -63,10 +109,10 @@ impl ConnectionRegistry {
         if let Some(code) = draining {
             conn.go_away(code);
         }
-        ConnectionRegistration {
+        Some(ConnectionRegistration {
             id,
             registry: self.clone(),
-        }
+        })
     }
 
     /// Send GoAway to every currently registered connection.
@@ -195,11 +241,21 @@ where
         let svc = svc.clone();
         let registry = registry.clone();
         async move {
-            ws.on_upgrade(move |socket| async move {
+            capped(ws).on_upgrade(move |socket| async move {
                 let transport = framed(AxumWs { inner: socket });
                 let (conn, driver) = bind(Side::Server, Config::default(), transport);
                 // no registry supplied → no bookkeeping cost per connection
-                let _registration = registry.as_ref().map(|r| r.register(conn.clone()));
+                let registration = match &registry {
+                    Some(r) => match r.register(conn.clone()) {
+                        Some(registration) => Some(registration),
+                        None => {
+                            reject_at_capacity(conn, driver);
+                            return;
+                        }
+                    },
+                    None => None,
+                };
+                let _registration = registration;
                 tokio::spawn(async move {
                     if let Err(error) = driver.run().await {
                         tracing::debug!(%error, "server ws connection driver stopped");
@@ -209,6 +265,27 @@ where
             })
         }
     })
+}
+
+/// Reject a connection that was accepted but is over the registry's
+/// connection cap: run the driver just long enough to flush a GoAway, then
+/// tear the transport down. Never registers the connection, so no slot is
+/// leaked.
+fn reject_at_capacity<T>(conn: Connection, driver: slozhn_frame::ConnectionDriver<T>)
+where
+    T: Stream<Item = slozhn_frame::proto::v1::Frame>
+        + Sink<slozhn_frame::proto::v1::Frame, Error = TransportClosed>
+        + Unpin
+        + Send
+        + 'static,
+{
+    tokio::spawn(async move {
+        if let Err(error) = driver.run().await {
+            tracing::debug!(%error, "rejected server ws connection driver stopped");
+        }
+    });
+    conn.go_away(GoAwayCode::Internal);
+    conn.close();
 }
 
 /// gRPC-over-WS with the session layer (spec §8): streams survive disconnects.
@@ -274,7 +351,7 @@ where
         let manager = manager.clone();
         let registry = registry.clone();
         async move {
-            ws.on_upgrade(move |socket| async move {
+            capped(ws).on_upgrade(move |socket| async move {
                 let transport: BoxFrameTransport =
                     Box::pin(framed(AxumWs { inner: socket }));
                 match manager.accept(transport).await {
@@ -285,8 +362,17 @@ where
                             client_hello,
                             session_transport,
                         );
-                        let _registration =
-                            registry.as_ref().map(|r| r.register(conn.clone()));
+                        let registration = match &registry {
+                            Some(r) => match r.register(conn.clone()) {
+                                Some(registration) => Some(registration),
+                                None => {
+                                    reject_at_capacity(conn, driver);
+                                    return;
+                                }
+                            },
+                            None => None,
+                        };
+                        let _registration = registration;
                         tokio::spawn(async move {
                             if let Err(error) = driver.run().await {
                                 tracing::debug!(%error, "server session ws connection driver stopped");
@@ -396,5 +482,36 @@ mod tests {
         })
         .await
         .expect("newly registered connection should receive drain GoAway");
+    }
+
+    #[tokio::test]
+    async fn registry_rejects_connections_over_max_connections() {
+        let registry = ConnectionRegistry::with_max_connections(1);
+
+        let (_client_transport_a, server_transport_a) = loopback::pair();
+        let (server_a, server_driver_a) = bind(Side::Server, Config::default(), server_transport_a);
+        let registration_a = registry.register(server_a);
+        assert!(
+            registration_a.is_some(),
+            "first connection should be admitted under the cap"
+        );
+        tokio::spawn(async move {
+            let _ = server_driver_a.run().await;
+        });
+        assert_eq!(registry.len(), 1);
+
+        let (_client_transport_b, server_transport_b) = loopback::pair();
+        let (server_b, _server_driver_b) = bind(Side::Server, Config::default(), server_transport_b);
+        let registration_b = registry.register(server_b);
+        assert!(
+            registration_b.is_none(),
+            "second connection should be rejected once at capacity"
+        );
+        // Rejection must not leak a slot into the registry.
+        assert_eq!(registry.len(), 1);
+
+        // The first connection stays registered/up while the second was rejected.
+        drop(registration_a);
+        assert_eq!(registry.len(), 0);
     }
 }

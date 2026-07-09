@@ -57,15 +57,26 @@ use tonic::body::Body as TonicBody;
 type MsgValidator<E> = Arc<dyn Fn(&[u8]) -> Result<(), Vec<E>> + Send + Sync>;
 type Caster<E> = Arc<dyn Fn(&str, Vec<E>) -> tonic::Status + Send + Sync>;
 
+/// Default cap on a single gRPC message's declared length: without one, a
+/// peer sending a 4-byte length prefix claiming up to ~4 GiB forces
+/// unbounded `BytesMut` growth while the layer waits for the rest of the
+/// (possibly nonexistent) message. Matches `slozhn_frame::MAX_MESSAGE_SIZE`.
+pub const DEFAULT_MAX_MESSAGE_BYTES: usize = 4 * 1024 * 1024;
+
 /// See the module docs.
 pub struct ValidateLayer<E> {
     validators: HashMap<String, MsgValidator<E>>,
     caster: Caster<E>,
+    max_message_bytes: usize,
 }
 
 impl<E> Clone for ValidateLayer<E> {
     fn clone(&self) -> Self {
-        Self { validators: self.validators.clone(), caster: self.caster.clone() }
+        Self {
+            validators: self.validators.clone(),
+            caster: self.caster.clone(),
+            max_message_bytes: self.max_message_bytes,
+        }
     }
 }
 
@@ -88,6 +99,7 @@ impl<E: std::fmt::Display + Send + Sync + 'static> ValidateLayer<E> {
                     .join("; ");
                 tonic::Status::invalid_argument(msg)
             }),
+            max_message_bytes: DEFAULT_MAX_MESSAGE_BYTES,
         }
     }
 }
@@ -107,6 +119,15 @@ impl<E> ValidateLayer<E> {
         f: impl Fn(&str, Vec<E>) -> tonic::Status + Send + Sync + 'static,
     ) -> Self {
         self.caster = Arc::new(f);
+        self
+    }
+
+    /// Cap on a single message's declared length (the 4-byte gRPC length
+    /// prefix). A declared length above the cap fails the body immediately
+    /// with `RESOURCE_EXHAUSTED`, before buffering anywhere near that many
+    /// bytes. Default [`DEFAULT_MAX_MESSAGE_BYTES`].
+    pub fn max_message_bytes(mut self, max_message_bytes: usize) -> Self {
+        self.max_message_bytes = max_message_bytes;
         self
     }
 
@@ -210,6 +231,7 @@ impl<S, E> tower::Layer<S> for ValidateLayer<E> {
             inner,
             validators: Arc::new(self.validators.clone()),
             caster: self.caster.clone(),
+            max_message_bytes: self.max_message_bytes,
         }
     }
 }
@@ -218,6 +240,7 @@ pub struct ValidateService<S, E> {
     inner: S,
     validators: Arc<HashMap<String, MsgValidator<E>>>,
     caster: Caster<E>,
+    max_message_bytes: usize,
 }
 
 impl<S: Clone, E> Clone for ValidateService<S, E> {
@@ -226,6 +249,7 @@ impl<S: Clone, E> Clone for ValidateService<S, E> {
             inner: self.inner.clone(),
             validators: self.validators.clone(),
             caster: self.caster.clone(),
+            max_message_bytes: self.max_message_bytes,
         }
     }
 }
@@ -252,6 +276,7 @@ where
         let validator = validator.clone();
         let caster = self.caster.clone();
         let method = method.to_owned();
+        let max_message_bytes = self.max_message_bytes;
 
         let req = req.map(move |body| {
             TonicBody::new(ValidatedBody {
@@ -261,6 +286,7 @@ where
                 method,
                 buf: BytesMut::new(),
                 failed: false,
+                max_message_bytes,
             })
         });
         self.inner.call(req)
@@ -279,24 +305,41 @@ pin_project! {
         caster: Caster<E>,
         method: String,
         // Accumulates the byte stream for message re-assembly; consumed
-        // message-by-message, so it holds at most one partial message.
+        // message-by-message, so it holds at most one partial message
+        // (bounded by `max_message_bytes` — see `check_buffered`).
         buf: BytesMut,
         failed: bool,
+        max_message_bytes: usize,
     }
+}
+
+/// Outcome of [`ValidatedBody::check_buffered`]: either PGV violations from a
+/// registered validator, or a declared message length above the cap — kept
+/// distinct so the caller can respond with `RESOURCE_EXHAUSTED` directly
+/// instead of routing through the user's `Caster` (which only knows `E`).
+enum CheckError<E> {
+    Violations(Vec<E>),
+    TooLarge { len: usize, max: usize },
 }
 
 impl<E> ValidatedBody<E> {
     /// Validate every complete length-prefixed message currently in `buf`.
+    /// Bails out as soon as a declared length exceeds `max_message_bytes`,
+    /// before buffering anywhere near that many bytes.
     fn check_buffered(
         buf: &mut BytesMut,
         validator: &MsgValidator<E>,
-    ) -> Result<(), Vec<E>> {
+        max_message_bytes: usize,
+    ) -> Result<(), CheckError<E>> {
         loop {
             if buf.len() < 5 {
                 return Ok(());
             }
             let compressed = buf[0] != 0;
             let len = u32::from_be_bytes([buf[1], buf[2], buf[3], buf[4]]) as usize;
+            if len > max_message_bytes {
+                return Err(CheckError::TooLarge { len, max: max_message_bytes });
+            }
             if buf.len() < 5 + len {
                 return Ok(()); // partial message — wait for more chunks
             }
@@ -305,7 +348,7 @@ impl<E> ValidatedBody<E> {
             if !compressed {
                 // compressed messages are skipped by design: validating
                 // would require decompressing here
-                validator(&message)?;
+                validator(&message).map_err(CheckError::Violations)?;
             }
         }
     }
@@ -327,9 +370,9 @@ impl<E: Send + Sync + 'static> http_body::Body for ValidatedBody<E> {
             Some(Ok(frame)) => match frame.into_data() {
                 Ok(data) => {
                     this.buf.extend_from_slice(&data);
-                    match Self::check_buffered(this.buf, this.validator) {
+                    match Self::check_buffered(this.buf, this.validator, *this.max_message_bytes) {
                         Ok(()) => Poll::Ready(Some(Ok(Frame::data(data)))),
-                        Err(violations) => {
+                        Err(CheckError::Violations(violations)) => {
                             *this.failed = true;
                             tracing::debug!(
                                 method = %this.method,
@@ -342,6 +385,25 @@ impl<E: Send + Sync + 'static> http_body::Body for ValidatedBody<E> {
                             )
                             .increment(1);
                             let status = (this.caster)(this.method, violations);
+                            Poll::Ready(Some(Err(status)))
+                        }
+                        Err(CheckError::TooLarge { len, max }) => {
+                            *this.failed = true;
+                            tracing::warn!(
+                                method = %this.method,
+                                len,
+                                max,
+                                "request message exceeds validation size limit",
+                            );
+                            metrics::counter!(
+                                "slozhn_validation_failed_total",
+                                "method" => this.method.clone(),
+                            )
+                            .increment(1);
+                            let status = tonic::Status::new(
+                                tonic::Code::ResourceExhausted,
+                                "message exceeds validation size limit",
+                            );
                             Poll::Ready(Some(Err(status)))
                         }
                     }
@@ -515,6 +577,43 @@ mod tests {
         let status = resp.into_body().unwrap_err();
         assert_eq!(status.code(), tonic::Code::InvalidArgument);
         assert!(status.message().contains("name"), "{}", status.message());
+    }
+
+    #[tokio::test]
+    async fn oversized_length_prefix_fails_fast_without_buffering_len_bytes() {
+        // A peer declaring ~1 GiB in the length prefix but sending only a
+        // handful of bytes after it must be rejected as soon as the prefix
+        // is read — not once (never) 1 GiB has been buffered.
+        let huge_len: u32 = 1024 * 1024 * 1024;
+        let mut body = vec![0u8]; // uncompressed
+        body.extend_from_slice(&huge_len.to_be_bytes());
+        body.extend_from_slice(b"only-a-few-bytes-follow");
+
+        let mut svc = name_rule().layer(draining_service());
+        let resp = svc.ready().await.unwrap().call(req("/t.S/M", body)).await.unwrap();
+        let status = resp.into_body().unwrap_err();
+        assert_eq!(status.code(), tonic::Code::ResourceExhausted);
+    }
+
+    #[tokio::test]
+    async fn message_at_or_under_cap_is_still_validated() {
+        let layer = name_rule().max_message_bytes(16);
+        let mut svc = layer.layer(draining_service());
+        let body = grpc_frame(&TestMsg { name: "alice".into() });
+
+        let resp = svc.ready().await.unwrap().call(req("/t.S/M", body.clone())).await.unwrap();
+        assert_eq!(resp.into_body().unwrap(), Bytes::from(body));
+    }
+
+    #[tokio::test]
+    async fn message_over_custom_cap_is_rejected() {
+        let layer = name_rule().max_message_bytes(4);
+        let mut svc = layer.layer(draining_service());
+        let body = grpc_frame(&TestMsg { name: "alice".into() }); // payload > 4 bytes
+
+        let resp = svc.ready().await.unwrap().call(req("/t.S/M", body)).await.unwrap();
+        let status = resp.into_body().unwrap_err();
+        assert_eq!(status.code(), tonic::Code::ResourceExhausted);
     }
 
     #[tokio::test]

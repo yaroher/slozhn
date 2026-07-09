@@ -111,6 +111,7 @@ async fn hello_exchange_echoes_version_and_windows() {
         initial_stream_window: 12_345,
         initial_connection_window: 54_321,
         max_streams: 8,
+        ..Config::default()
     };
     let (a, mut raw) = loopback::pair();
     let (_client, drv) = bind(Side::Client, cfg, a);

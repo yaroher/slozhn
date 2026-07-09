@@ -6,13 +6,14 @@ use std::collections::{HashMap, VecDeque};
 use std::fmt::Write as _;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
-use std::task::{Context, Poll};
+use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 
 use bytes::Bytes;
 use futures::{Future, Sink, SinkExt, Stream, StreamExt};
 use slozhn_frame::TransportClosed;
 use slozhn_frame::proto::v1::{Frame, Hello, frame};
+use subtle::ConstantTimeEq;
 use tokio::sync::mpsc;
 
 use crate::client::{BoxFrameTransport, FrameDuplex};
@@ -107,7 +108,12 @@ impl SessionManager {
         }
 
         if hello.session_id.is_empty() {
-            // new session — enforce the concurrent session cap first
+            // new session — fast-path cap check to avoid doing handshake
+            // work when we're clearly over the limit. This is NOT
+            // authoritative: concurrent handshakes can both pass it and
+            // still be within the window before either inserts. The
+            // authoritative check happens below, under the same lock
+            // acquisition as the insert itself.
             let current = self.sessions.lock().expect("registry lock").len();
             if current >= self.config.max_sessions {
                 tracing::warn!(
@@ -130,24 +136,65 @@ impl SessionManager {
             let session_id = Bytes::copy_from_slice(uuid::Uuid::new_v4().as_bytes());
             let session_log_id = session_label(&session_id);
             let token = Bytes::copy_from_slice(uuid::Uuid::new_v4().as_bytes());
-            let reply = server_hello(&self.config.frame, &session_id, &token, 0, false);
-            transport.send(reply).await.map_err(|_| {
-                tracing::warn!("server session transport closed during hello reply");
-                SessionError::Handshake("closed during hello reply".into())
-            })?;
 
+            // Authoritative cap check + insert under a single lock
+            // acquisition — this closes the TOCTOU race where N concurrent
+            // handshakes each pass the fast-path check above (which is
+            // separated from the insert by an async `.send().await`) and
+            // all overshoot the cap. Reserve the slot BEFORE sending the
+            // accept reply, so the session is fully registered by the time
+            // the peer could possibly use it (e.g. attempt a resume).
             let (attach_tx, attach_rx) = mpsc::unbounded_channel();
-            {
+            // Resolve accept-vs-reject and (if accepted) insert, all while
+            // holding the lock only for this synchronous block — the guard
+            // must not be held across an `.await` below.
+            let over_cap = {
                 let mut sessions = self.sessions.lock().expect("registry lock");
-                sessions.insert(
-                    session_id.clone(),
-                    SessionEntry {
-                        token: token.clone(),
-                        attach_tx,
-                    },
+                if sessions.len() >= self.config.max_sessions {
+                    true
+                } else {
+                    sessions.insert(
+                        session_id.clone(),
+                        SessionEntry {
+                            token: token.clone(),
+                            attach_tx,
+                        },
+                    );
+                    // absolute value, not inc/dec — immune to drift on double removal
+                    metrics::gauge!("slozhn_sessions_active").set(sessions.len() as f64);
+                    false
+                }
+            };
+            if over_cap {
+                tracing::warn!(
+                    max_sessions = self.config.max_sessions,
+                    "server session limit reached at insert time; rejecting new session",
                 );
-                // absolute value, not inc/dec — immune to drift on double removal
+                metrics::counter!("slozhn_sessions_rejected_total").increment(1);
+                let _ = transport
+                    .send(server_hello(
+                        &self.config.frame,
+                        &Bytes::new(),
+                        &Bytes::new(),
+                        0,
+                        true,
+                    ))
+                    .await;
+                return Ok(None);
+            }
+
+            let reply = server_hello(&self.config.frame, &session_id, &token, 0, false);
+            if let Err(e) = transport.send(reply).await {
+                tracing::warn!("server session transport closed during hello reply");
+                // the send failed — the session never really started, undo
+                // the reservation so it doesn't count against the cap
+                let mut sessions = self.sessions.lock().expect("registry lock");
+                sessions.remove(&session_id);
                 metrics::gauge!("slozhn_sessions_active").set(sessions.len() as f64);
+                drop(sessions);
+                return Err(SessionError::Handshake(format!(
+                    "closed during hello reply: {e}"
+                )));
             }
             tracing::info!(
                 session_id = %session_log_id,
@@ -178,6 +225,7 @@ impl SessionManager {
                 token,
                 ttl: self.config.ttl,
                 registry: self.sessions.clone(),
+                ready_waker: None,
             };
             return Ok(Some((st, hello)));
         }
@@ -188,8 +236,16 @@ impl SessionManager {
         let mut transport = Some(transport);
         {
             let sessions = self.sessions.lock().expect("registry lock");
+            // Constant-time comparison of a 128-bit bearer token: `==` on
+            // byte slices short-circuits on the first mismatching byte,
+            // which leaks timing information an attacker could use to guess
+            // the token byte-by-byte. `ct_eq` requires equal-length inputs
+            // to be meaningful, so a length mismatch is handled explicitly
+            // (and is itself not a timing oracle, since token length isn't
+            // secret).
             if let Some(entry) = sessions.get(&session_id)
-                && entry.token.as_ref() == hello.resume_token.as_ref()
+                && entry.token.len() == hello.resume_token.len()
+                && bool::from(entry.token.as_ref().ct_eq(hello.resume_token.as_ref()))
             {
                 let t = transport.take().expect("present");
                 match entry.attach_tx.send((t, hello.last_recv_seq)) {
@@ -280,6 +336,11 @@ pub struct ServerSessionTransport {
     token: Bytes,
     ttl: Duration,
     registry: Registry,
+    /// Waker for a `poll_ready` call parked because the replay buffer is
+    /// over its backpressure threshold; woken whenever the buffer might have
+    /// shrunk (Ack processed, resume replay trim) or the transport died.
+    /// Mirrors the client-side `SessionTransport::ready_waker`.
+    ready_waker: Option<Waker>,
 }
 
 impl ServerSessionTransport {
@@ -326,6 +387,20 @@ impl ServerSessionTransport {
             metrics::gauge!("slozhn_sessions_active").set(sessions.len() as f64);
         }
         self.phase = SPhase::Dead;
+        // unstick a poll_ready parked on backpressure so it observes Dead
+        // and returns an error, instead of hanging forever
+        self.wake_ready();
+    }
+
+    /// Wake a `poll_ready` parked on backpressure. Called at every point the
+    /// replay buffer might have shrunk (Ack processed, resume replay trim)
+    /// or the transport has died; harmless to call spuriously since
+    /// `poll_ready` just re-checks and re-parks if still over threshold.
+    /// Mirrors the client-side `SessionTransport::wake_ready`.
+    fn wake_ready(&mut self) {
+        if let Some(w) = self.ready_waker.take() {
+            w.wake();
+        }
     }
 
     /// A new physical transport arrived: reply with Hello + replay.
@@ -348,6 +423,9 @@ impl ServerSessionTransport {
         );
         self.pending_out.extend(replay);
         self.phase = SPhase::Active(t);
+        // resume replay trimmed the buffer to what the peer already acked —
+        // room may have freed up
+        self.wake_ready();
     }
 }
 
@@ -446,7 +524,13 @@ impl Stream for ServerSessionTransport {
                                     }
                                     return Poll::Ready(Some(f));
                                 }
-                                Ingress::Consumed => continue,
+                                Ingress::Consumed => {
+                                    // may have been an Ack that trimmed the
+                                    // replay buffer — a parked poll_ready
+                                    // might now have room
+                                    this.wake_ready();
+                                    continue;
+                                }
                             }
                         }
                         Poll::Ready(None) => {
@@ -464,7 +548,22 @@ impl Stream for ServerSessionTransport {
 impl Sink<Frame> for ServerSessionTransport {
     type Error = TransportClosed;
 
-    fn poll_ready(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+    fn poll_ready(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        let this = &mut *self;
+        if matches!(this.phase, SPhase::Dead) {
+            this.ready_waker = None;
+            return Poll::Ready(Err(TransportClosed));
+        }
+        let (bytes, cap) = this.core.buffer_usage();
+        // Backpressure at 80% of the replay buffer cap, instead of racing
+        // start_send into BufferOverflow and killing the session. Mirrors
+        // the client-side SessionTransport::poll_ready (client.rs); without
+        // this a server app producing faster than the client acks runs
+        // straight into BufferOverflow, which kills the whole session.
+        if cap > 0 && bytes.saturating_mul(10) > cap.saturating_mul(8) {
+            this.ready_waker = Some(cx.waker().clone());
+            return Poll::Pending;
+        }
         Poll::Ready(Ok(()))
     }
 

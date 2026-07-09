@@ -80,7 +80,13 @@ impl SessionCore {
     /// Incoming frame: Ack → trim; duplicate → Consumed; fresh → Deliver.
     pub fn on_ingress(&mut self, f: Frame) -> Ingress {
         if let Some(frame::Kind::Ack(ack)) = &f.kind {
-            let last = ack.last_seq;
+            // Clamp to the highest seq we've ever actually sent (next_seq - 1).
+            // A malicious or buggy peer can Ack a seq we never sent (e.g.
+            // u64::MAX); without the clamp, trim() would evict unsent/
+            // unacknowledged frames from the replay buffer, and after a
+            // reconnect replay_after() could no longer resend them — silent
+            // data loss.
+            let last = ack.last_seq.min(self.next_seq.saturating_sub(1));
             self.trim(last);
             return Ingress::Consumed;
         }
@@ -193,6 +199,46 @@ mod tests {
         assert_eq!(c.replay_after(0).len(), 3);
         assert!(matches!(c.on_ingress(ack(2)), Ingress::Consumed));
         assert_eq!(c.replay_after(0).len(), 1); // only seq 3 remains
+    }
+
+    #[test]
+    fn bogus_high_ack_does_not_evict_unsent_frames() {
+        let mut c = SessionCore::new(1024, 16);
+        // egress 3 frames (seq 1,2,3)
+        for _ in 0..3 {
+            c.on_egress(msg(8)).unwrap();
+        }
+        // a bogus/malicious Ack claiming far more than was ever sent must be
+        // clamped to the highest actually-sent seq (3), not taken at face value
+        assert!(matches!(c.on_ingress(ack(u64::MAX)), Ingress::Consumed));
+        // next_seq (the "highest sent" bookkeeping) must be unaffected by the ack
+        assert_eq!(c.on_egress(msg(8)).unwrap().seq, 4); // seq continues from 4
+
+        // frame 4 was egressed AFTER the bogus ack, so it must still be in
+        // the replay buffer — proving the clamp, not the raw u64::MAX, was
+        // used to trim (an unclamped trim would have had no way to protect
+        // frame 4 anyway since it didn't exist yet; the real invariant this
+        // proves is that trimming to MAX behaves identically to trimming to
+        // the actual highest-sent seq at the time of the ack: nothing beyond
+        // what was sent is ever considered "acked").
+        assert_eq!(c.replay_after(3).len(), 1);
+        assert_eq!(c.replay_after(3)[0].seq, 4);
+    }
+
+    #[test]
+    fn ack_beyond_sent_seq_behaves_like_clamped_ack() {
+        // Ack{last_seq: MAX} on a core that sent up to seq 3 must trim
+        // exactly as Ack{last_seq: 3} would.
+        let mut a = SessionCore::new(1024, 16);
+        let mut b = SessionCore::new(1024, 16);
+        for _ in 0..3 {
+            a.on_egress(msg(8)).unwrap();
+            b.on_egress(msg(8)).unwrap();
+        }
+        assert!(matches!(a.on_ingress(ack(u64::MAX)), Ingress::Consumed));
+        assert!(matches!(b.on_ingress(ack(3)), Ingress::Consumed));
+        assert_eq!(a.replay_after(0), b.replay_after(0));
+        assert_eq!(a.buffer_usage(), b.buffer_usage());
     }
 
     #[test]

@@ -3,6 +3,7 @@ name = "slozhn-grpc-tests"
 version = "0.0.0"
 publish = false
 edition.workspace = true
+rust-version.workspace = true
 
 [dependencies]
 slozhn-proto = { path = "../slozhn-proto" }

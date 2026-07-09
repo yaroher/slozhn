@@ -30,6 +30,13 @@
 //!   response body, once the deadline elapses.
 //! - [`MetricsLayer`] — one layer for BOTH sides: emits RPC start/inflight/
 //!   duration series through the `metrics` facade (exporter-agnostic).
+//! - [`OriginLayer`] — server-side `Origin` header allowlist, defending
+//!   against Cross-Site WebSocket Hijacking (browsers do not enforce
+//!   same-origin for WS themselves). Wrap it around the routes before
+//!   `grpc_ws`/`grpc_ws_session`.
+//! - [`RecoveryLayer`] — catches panics in the inner service so one bad
+//!   request can't tear down the whole connection driver: returns a
+//!   trailers-only `INTERNAL` response instead of unwinding through tower.
 //!
 //! Client wiring:
 //! ```ignore
@@ -53,6 +60,8 @@
 mod auth;
 mod idempotency;
 mod metrics;
+mod origin;
+mod recovery;
 mod retry;
 mod timeout;
 mod trace;
@@ -82,13 +91,15 @@ pub use idempotency::{
     IdempotencyLevel,
 };
 pub use metrics::{MetricsBody, MetricsFuture, MetricsLayer, MetricsService};
+pub use origin::{OriginLayer, OriginService};
 #[cfg(feature = "otel")]
 pub use otel_metrics::{OtelMetricsRecorder, otel_metrics_recorder};
 #[cfg(not(target_arch = "wasm32"))]
 pub use rate_limit::{
     Decision, InMemoryStore, Quota, RateKeyFn, RateLimitLayer, RateLimitService, RateLimitStore,
 };
+pub use recovery::{RecoveryLayer, RecoveryService};
 pub use retry::{RetryLayer, RetryPolicy, RetryService};
 pub use timeout::{TimeoutError, TimeoutLayer, TimeoutService};
 pub use trace::{ServerTraced, TraceLayer, TraceService, trace_server};
-pub use validate::{ValidateLayer, ValidateService};
+pub use validate::{DEFAULT_MAX_MESSAGE_BYTES, ValidateLayer, ValidateService};

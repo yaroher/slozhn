@@ -157,7 +157,21 @@ impl RateLimitStore for InMemoryStore {
 
 /// Bucket key from request metadata: `(headers, uri) -> Some(key)`.
 /// `None` groups the call into a shared `"anon"` bucket (still per method).
+///
+/// **Spoofing warning**: `headers`/`uri` are peer-controlled — a malicious
+/// caller can rotate any header (including `authorization`) to defeat
+/// per-caller limiting keyed this way. This variant is fine for coarse,
+/// best-effort bucketing (e.g. by IP forwarded through a trusted proxy
+/// header) but MUST NOT be relied on as a security boundary. To key on
+/// verified identity instead, use [`RateLimitLayer::key_by_request`] or
+/// [`RateLimitLayer::key_by_identity`], which see request extensions —
+/// where [`crate::Identity`] lands after [`crate::AuthLayer`] runs.
 pub type RateKeyFn = Arc<dyn Fn(&http::HeaderMap, &http::Uri) -> Option<String> + Send + Sync>;
+
+/// Bucket key from the full request: sees extensions (post-auth
+/// [`crate::Identity`]), headers, and uri. `None` groups the call into the
+/// shared `"anon"` bucket (still per method).
+type RateKeyReqFn = Arc<dyn Fn(&http::Request<TonicBody>) -> Option<String> + Send + Sync>;
 
 /// Server layer: GCRA rate limiting per method × caller key.
 /// See the module docs for the production shape.
@@ -166,7 +180,7 @@ pub struct RateLimitLayer {
     quota: Quota,
     /// `Some(quota)` — override; `None` — method is unlimited.
     per_method: HashMap<String, Option<Quota>>,
-    key_fn: Option<RateKeyFn>,
+    key_fn: Option<RateKeyReqFn>,
     store: Arc<dyn RateLimitStore>,
     fail_open: bool,
 }
@@ -196,20 +210,59 @@ impl RateLimitLayer {
         self
     }
 
-    /// Split buckets per caller with a custom key function.
+    /// Split buckets per caller with a custom key function over `(headers,
+    /// uri)`. **Spoofable**: see the [`RateKeyFn`] docs — headers are
+    /// peer-controlled. Prefer [`Self::key_by_identity`] when a verified
+    /// identity is available.
     pub fn key_by(
         mut self,
         f: impl Fn(&http::HeaderMap, &http::Uri) -> Option<String> + Send + Sync + 'static,
     ) -> Self {
-        self.key_fn = Some(Arc::new(f));
+        self.key_fn = Some(Arc::new(move |req: &http::Request<TonicBody>| {
+            f(req.headers(), req.uri())
+        }));
         self
     }
 
     /// Split buckets per caller by a metadata entry (e.g. `"x-api-key"` or
     /// `"authorization"`). Missing header → the shared `"anon"` bucket.
+    ///
+    /// **Spoofable**: the header value is entirely peer-controlled — a
+    /// caller can rotate it to defeat per-caller limiting. Use this only for
+    /// coarse/best-effort bucketing, never as a security boundary. Prefer
+    /// [`Self::key_by_identity`] to key on the post-auth identity instead.
     pub fn key_by_header(self, name: &'static str) -> Self {
         self.key_by(move |headers, _uri| {
             headers.get(name).and_then(|v| v.to_str().ok()).map(str::to_owned)
+        })
+    }
+
+    /// Split buckets per caller with a function over the full request,
+    /// including extensions — where a post-auth [`crate::Identity`] lands
+    /// once [`crate::AuthLayer`] runs upstream of this layer. This is the
+    /// way to key rate limiting on verified identity rather than
+    /// peer-controlled headers.
+    pub fn key_by_request(
+        mut self,
+        f: impl Fn(&http::Request<TonicBody>) -> Option<String> + Send + Sync + 'static,
+    ) -> Self {
+        self.key_fn = Some(Arc::new(f));
+        self
+    }
+
+    /// Split buckets per caller by the verified identity `AuthLayer` placed
+    /// in request extensions (`Identity<T>`), mapped to a key with `f`.
+    /// Requests with no `Identity<T>` extension (e.g. `AuthLayer` isn't
+    /// wired, or ran after this layer) fall back to the shared `"anon"`
+    /// bucket — order `RateLimitLayer` AFTER `AuthLayer` in the stack so
+    /// every authenticated call actually gets keyed.
+    pub fn key_by_identity<T, F>(self, f: F) -> Self
+    where
+        T: Clone + Send + Sync + 'static,
+        F: Fn(&T) -> String + Send + Sync + 'static,
+    {
+        self.key_by_request(move |req| {
+            req.extensions().get::<crate::auth::Identity<T>>().map(|identity| f(&identity.0))
         })
     }
 
@@ -300,7 +353,7 @@ where
         let caller = config
             .key_fn
             .as_ref()
-            .and_then(|f| f(req.headers(), req.uri()))
+            .and_then(|f| f(&req))
             .unwrap_or_else(|| "anon".to_owned());
         let key = format!("{method}\u{1f}{caller}");
 
@@ -494,6 +547,74 @@ mod tests {
         let t1 = t0 + Duration::from_millis(100);
         assert!(store.decide("k".into(), q, t1).allowed);
         assert!(!store.decide("k".into(), q, t1).allowed);
+    }
+
+    fn req_with_identity(
+        path: &str,
+        identity: Option<&str>,
+        header: Option<(&'static str, &str)>,
+    ) -> http::Request<TonicBody> {
+        let mut req = req(path, header);
+        if let Some(id) = identity {
+            req.extensions_mut().insert(crate::auth::Identity(id.to_owned()));
+        }
+        req
+    }
+
+    #[tokio::test]
+    async fn identity_keyed_buckets_ignore_spoofable_headers() {
+        let mut svc = RateLimitLayer::new(Quota::per_minute(60).burst(1))
+            .key_by_identity::<String, _>(|id: &String| id.clone())
+            .layer(ok_service());
+
+        // alice's first call passes.
+        let resp = svc
+            .ready()
+            .await
+            .unwrap()
+            .call(req_with_identity("/t.S/M", Some("alice"), Some(("authorization", "tok-a"))))
+            .await
+            .unwrap();
+        assert_eq!(status_of(&resp), None);
+
+        // same identity, header rotated to look like someone else: still
+        // bucketed as alice, still rate limited — the spoof is defeated.
+        let resp = svc
+            .ready()
+            .await
+            .unwrap()
+            .call(req_with_identity("/t.S/M", Some("alice"), Some(("authorization", "tok-rotated"))))
+            .await
+            .unwrap();
+        assert_eq!(status_of(&resp), Some(8), "spoofed header must not reset alice's bucket");
+    }
+
+    #[tokio::test]
+    async fn identity_keyed_buckets_are_independent_per_caller() {
+        let mut svc = RateLimitLayer::new(Quota::per_minute(60).burst(1))
+            .key_by_identity::<String, _>(|id: &String| id.clone())
+            .layer(ok_service());
+
+        let alice = || req_with_identity("/t.S/M", Some("alice"), None);
+        let bob = || req_with_identity("/t.S/M", Some("bob"), None);
+
+        assert_eq!(status_of(&svc.ready().await.unwrap().call(alice()).await.unwrap()), None);
+        assert_eq!(status_of(&svc.ready().await.unwrap().call(bob()).await.unwrap()), None);
+        assert_eq!(status_of(&svc.ready().await.unwrap().call(alice()).await.unwrap()), Some(8));
+        assert_eq!(status_of(&svc.ready().await.unwrap().call(bob()).await.unwrap()), Some(8));
+
+        // no identity at all → shared "anon" bucket, independent of both
+        assert_eq!(
+            status_of(
+                &svc.ready()
+                    .await
+                    .unwrap()
+                    .call(req_with_identity("/t.S/M", None, None))
+                    .await
+                    .unwrap()
+            ),
+            None
+        );
     }
 
     #[test]

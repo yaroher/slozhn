@@ -107,6 +107,14 @@ no tokio runtime. The browser `WebSocket` API cannot set headers — pass
 auth via query parameters or cookies (`.header(...)` is native-only and
 panics at build time on wasm).
 
+> **Warning — query-string tokens leak.** A token on the connection URL
+> (`?token=...`) ends up in reverse-proxy/CDN access logs, browser history,
+> and any `Referer` header sent from that page — all outside your control.
+> Prefer an `HttpOnly`, `SameSite` session cookie for the WebSocket upgrade
+> (paired with `OriginLayer`, see [Security](#security)), or send the token
+> in-band as per-RPC metadata once connected (`AuthTokenLayer`, see
+> [Authentication](#authentication)) instead of putting it on the URL.
+
 ## How it works
 
 ```
@@ -302,7 +310,9 @@ let retry = slozhn::middleware::RetryLayer::from_file_descriptor_set(
 .never_retry_method("/legacy.v1.Legacy/Create");
 ```
 
-Retried calls use jittered backoff and buffer request bodies up to 256 KiB;
+Retried calls use jittered exponential backoff (clamped to `max_backoff`,
+30 s by default — also what keeps the exponent computation from overflowing
+at very high `max_attempts`) and buffer request bodies up to 256 KiB;
 streaming requests are never replayed. A retried RPC may execute twice
 server-side — use `unsafe_retry_all_buffered()` only when the wrapped client is
 already scoped to idempotent methods.
@@ -529,6 +539,12 @@ malformed protobuf is left to the tonic codec. `prost-validate` is
 fail-fast today, so the caster receives one violation per failing message —
 the `Vec` signature is ready for a validate-all upstream.
 
+Every message's declared length is capped at `.max_message_bytes(n)`
+(`DEFAULT_MAX_MESSAGE_BYTES`, 4 MiB, if unset). A peer whose length prefix
+declares more than the cap fails the body immediately with
+`RESOURCE_EXHAUSTED` — the layer never buffers anywhere near the declared
+size trying to reassemble a message that's over the limit.
+
 ### Rate limiting
 
 `RateLimitLayer` (server, non-wasm) enforces GCRA quotas — precise sustained
@@ -550,6 +566,25 @@ per-process; behind a load balancer implement the trait over a shared store
 the stored arrival time — the decision must be atomic in the store). Store
 errors fail open by default (availability over strictness); `.fail_closed()`
 turns them into `UNAVAILABLE`.
+
+> **Key on verified identity, not raw headers.** `.key_by_header(...)` (and
+> `.key_by`) key on whatever the peer sent — a caller can rotate a header to
+> get a fresh bucket and defeat per-caller limiting. When `AuthLayer` runs
+> upstream, key on its verified `Identity<T>` instead:
+> ```rust
+> let limited = slozhn::middleware::RateLimitLayer::new(Quota::per_second(50))
+>     .key_by_identity::<UserId, _>(|id| id.to_string())
+>     .layer(auth_secured_routes); // RateLimitLayer wraps routes that AuthLayer already ran on
+> ```
+> `.key_by_request(...)` is the general escape hatch if the key needs more
+> than just the identity (headers, uri, and extensions together).
+
+Middleware here rate-limits at the RPC layer — it has no visibility into
+protocol control frames (`Ping`, `WindowUpdate`, rapid open/cancel churn)
+handled by `slozhn-frame`/the connection driver below it. Flooding at that
+level isn't bounded by `RateLimitLayer`; it belongs at the connection/proxy
+layer (a reverse proxy's connection-rate limits, or frame-level throttling
+in the transport itself), which is out of scope for this crate.
 
 ### Authentication
 
@@ -575,6 +610,77 @@ Router::new().route("/rpc", slozhn::server::grpc_ws(secured));
 let stack = AuthTokenLayer::bearer(|| current_token()).layer(channel);
 let client = EchoClient::new(stack);
 ```
+
+## Security
+
+Deployment hardening notes for a browser-facing bridge — read this alongside
+[Middleware](#middleware-feature-middleware) before going to production.
+
+### Origin checking (CSWSH defense)
+
+Browsers do **not** enforce same-origin for WebSocket connections and run no
+CORS preflight on the upgrade request — any page can open a WS connection to
+your server and have the browser attach ambient credentials (cookies) to it.
+If the server accepts cookie-based auth, that is a hijack primitive unless
+the server checks `Origin` itself. `OriginLayer` does that check; wrap it
+around the routes before `grpc_ws`/`grpc_ws_session`, above every other
+layer:
+
+```rust
+let checked = slozhn::middleware::OriginLayer::new(["https://app.example.com"])
+    .layer(routes);
+Router::new().route("/rpc", slozhn::server::grpc_ws(checked));
+```
+
+Exact-match allowlist by default; a request with no `Origin` header is
+rejected unless you call `.allow_missing_origin()` (native clients that never
+send one). `OriginLayer::allow_any()` disables the check entirely — an
+explicit, documented escape hatch for deployments that are never reachable
+from a browser. A mismatch returns a trailers-only `PERMISSION_DENIED`
+(code 7), same shape as `AuthLayer`'s rejection.
+
+### TLS
+
+`slozhn` does not terminate TLS itself — it speaks plain `ws://`/HTTP over
+whatever axum listener you give it. In production, put it behind a reverse
+proxy or `axum-server` configured with a certificate and expose `wss://` to
+clients; the bridge only sees decrypted traffic either way. Serving `ws://`
+across an untrusted network exposes bearer tokens, cookies, and RPC payloads
+to on-path observers — treat plaintext WebSocket as a local/dev-only setup.
+
+### Identity-bound rate limiting
+
+`RateLimitLayer.key_by_header(...)` keys on peer-controlled data by
+default — see [Rate limiting](#rate-limiting) for `.key_by_identity(...)`,
+which binds buckets to the verified `Identity<T>` `AuthLayer` places in
+request extensions instead, so rotating a header can't buy a fresh quota.
+
+### Protocol control frames are out of scope here
+
+`RateLimitLayer` and `DedupLayer` operate per-RPC, above the frame layer —
+they cannot see or bound `Ping`/`WindowUpdate` floods or rapid open/cancel
+churn at the `slozhn-frame`/connection level. That protection belongs at the
+connection or reverse-proxy layer (connection-rate limits, frame-level
+throttling in the transport), not in this middleware stack.
+
+### Panic recovery
+
+A panic inside a handler unwinds straight through tower/tonic by default and
+kills whatever task drives the connection — on the WS bridge that tears down
+every other in-flight RPC sharing that connection, not just the one that
+panicked. `RecoveryLayer` catches it and returns a trailers-only `INTERNAL`
+(code 13) response instead:
+
+```rust
+let recovered = slozhn::middleware::RecoveryLayer::new().layer(routes);
+Router::new().route("/rpc", slozhn::server::grpc_ws(recovered));
+```
+
+Every recovered panic logs via `tracing::error!` and increments
+`slozhn_panics_recovered_total`. Place it as the outermost layer (or at
+least outside anything whose own state could be left inconsistent by an
+unwind) so a bug in one handler degrades to a single failed RPC instead of a
+dropped connection.
 
 ### Logging in the browser
 

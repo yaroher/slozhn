@@ -2,6 +2,7 @@
 name = "slozhn-middleware"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Ready-made tower layers for slozhn: tracing/logging (OTel semconv), retries"

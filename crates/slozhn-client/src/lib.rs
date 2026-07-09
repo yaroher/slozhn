@@ -19,6 +19,7 @@ use slozhn_frame::Connection;
 pub type Spawner = Arc<dyn Fn(BoxFuture<'static, ()>) + Send + Sync>;
 
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum ClientError {
     #[error("open failed: {0}")]
     Open(#[from] slozhn_frame::OpenError),
@@ -83,7 +84,13 @@ impl tower::Service<http::Request<tonic::body::Body>> for Channel {
                                 return; // stream died — the terminal event already happened
                             }
                         }
-                        Some(Err(_)) => return, // body error — dropping RecvHalf cancels the RPC
+                        Some(Err(_)) => {
+                            // body error — explicitly cancel so the peer is
+                            // told the RPC is dead now, instead of relying
+                            // on drop semantics (SendHalf's Drop is a no-op).
+                            send.cancel();
+                            return;
+                        }
                         None => break,
                     }
                 }

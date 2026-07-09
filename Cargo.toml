@@ -18,6 +18,9 @@ members = [
 [workspace.package]
 version = "1.0.3"
 edition = "2024"
+# let-chains (`if let ... && ...`, used in slozhn-client's reconnect loop)
+# stabilized in 1.88; edition 2024 alone only requires 1.85.
+rust-version = "1.88"
 license = "MIT"
 repository = "https://github.com/yaroher/slozhn"
 

@@ -453,3 +453,84 @@ async fn sink_backpressure_stalls_then_releases_after_resume_ack() {
 
     sender.abort();
 }
+
+/// Server-side counterpart of `sink_backpressure_stalls_then_releases_after_resume_ack`:
+/// `ServerSessionTransport` must apply the same 80%-of-cap Sink backpressure
+/// as the client instead of racing straight into `BufferOverflow` (which
+/// kills the whole session via `die()`), and a parked `poll_ready` must
+/// resolve once an incoming Ack trims the replay buffer.
+#[tokio::test]
+async fn server_sink_backpressure_stalls_then_releases_after_ack() {
+    use slozhn_frame::proto::v1::Ack;
+    use slozhn_session::server::{ServerSessionConfig, SessionManager};
+
+    let manager = SessionManager::new(ServerSessionConfig {
+        session: SessionConfig {
+            replay_buffer_bytes: 256, // tiny — a handful of frames fills it
+            keepalive_interval: None,
+            ack_every: 1000,                     // acks don't interfere with the scenario
+            ack_delay: Duration::from_secs(600), // timer won't fire
+            ..Default::default()
+        },
+        ..Default::default()
+    });
+
+    let (client_end, server_end) = loopback::pair();
+    let mut client_end: BoxFrameTransport = Box::pin(client_end);
+    client_end.send(client_hello()).await.unwrap();
+    let (mut server_transport, _hello) = manager
+        .accept(Box::pin(server_end))
+        .await
+        .expect("accept ok")
+        .expect("first session must be accepted");
+    let _server_hello_reply = client_end.next().await.expect("hello reply");
+
+    // Fill the replay buffer from the server app side: keep sending until
+    // poll_ready stalls (Pending) instead of a send erroring out with
+    // BufferOverflow.
+    let mut sent = 0u32;
+    loop {
+        match tokio::time::timeout(
+            Duration::from_millis(50),
+            server_transport.send(msg(1, (sent % 256) as u8)),
+        )
+        .await
+        {
+            Ok(Ok(())) => {
+                sent += 1;
+                assert!(sent <= 200, "buffer never filled — expected backpressure");
+            }
+            Ok(Err(e)) => panic!("send failed unexpectedly (session must not die): {e:?}"),
+            Err(_) => break, // stalled — backpressure engaged, not overflowed
+        }
+    }
+    assert!(sent > 0, "expected at least one send before stalling");
+
+    // Ack everything sent so far, over the still-Active physical connection
+    // — this must trim the server's replay buffer.
+    client_end
+        .send(Frame {
+            stream_id: 0,
+            seq: 0,
+            kind: Some(frame::Kind::Ack(Ack {
+                last_seq: sent as u64,
+            })),
+        })
+        .await
+        .unwrap();
+
+    // Let the server transport observe the Ack on its Stream side — this is
+    // what processes the trim and wakes any parked poll_ready.
+    let _ = tokio::time::timeout(Duration::from_millis(200), server_transport.next()).await;
+
+    // A further send must now resolve promptly instead of staying stuck.
+    let resumed = tokio::time::timeout(
+        Duration::from_millis(200),
+        server_transport.send(msg(1, 99)),
+    )
+    .await;
+    assert!(
+        matches!(resumed, Ok(Ok(()))),
+        "server send must unstick after the Ack trims the replay buffer"
+    );
+}

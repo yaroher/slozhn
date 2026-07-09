@@ -73,6 +73,14 @@ impl StreamState {
         if self.remote_half_closed {
             return Err(ProtocolError::AfterHalfClose(stream_id));
         }
+        // Mirror the send-side borrow rule (spec §5): a message is only
+        // admitted while the window is still positive; one message may then
+        // drive it negative (the borrow), but a peer that keeps sending once
+        // the window is already <= 0 is ignoring our credit — flow-control
+        // violation, connection-fatal (h2 FLOW_CONTROL_ERROR equivalent).
+        if !self.recv_window.can_send() {
+            return Err(ProtocolError::FlowControlViolation(stream_id));
+        }
         self.recv_window.consume(msg.payload.len());
         Ok(StreamEvent::Message(msg.payload))
     }
@@ -192,6 +200,27 @@ mod tests {
         // after a terminal, frames are ignored, not an error (Cancel/Status race)
         assert!(matches!(s.on_cancel(), StreamEvent::Cancelled));
         assert!(matches!(s.on_message(1, msg(1)), Ok(StreamEvent::RemoteHalfClose)));
+    }
+
+    #[test]
+    fn flow_control_violation_rejected_when_window_exhausted() {
+        // window 10: a single 25-byte message overshoots it (borrow, allowed
+        // once) — window becomes -15. A further message while the window is
+        // still <= 0 is a flow-control violation, not silently accepted.
+        let mut s = StreamState::new(false, DEFAULT_WINDOW, 10);
+        assert!(matches!(s.on_message(1, msg(25)).unwrap(), StreamEvent::Message(_)));
+        assert_eq!(
+            s.on_message(1, msg(1)),
+            Err(ProtocolError::FlowControlViolation(1))
+        );
+    }
+
+    #[test]
+    fn flow_control_normal_in_window_message_passes() {
+        let mut s = StreamState::new(false, DEFAULT_WINDOW, 10);
+        assert!(matches!(s.on_message(1, msg(4)).unwrap(), StreamEvent::Message(_)));
+        // window still positive (10 - 4 = 6) — a second small message is fine
+        assert!(matches!(s.on_message(1, msg(4)).unwrap(), StreamEvent::Message(_)));
     }
 
     #[test]

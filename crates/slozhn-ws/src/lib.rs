@@ -11,6 +11,7 @@ pub struct WsConfig {
 }
 
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum WsError {
     #[error("invalid url: {0}")]
     Url(String),

@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use bytes::Bytes;
 use futures::{Sink, SinkExt, Stream, StreamExt};
@@ -11,14 +12,17 @@ use crate::flow::Window;
 use crate::ids::{Side, StreamIdAllocator};
 use crate::proto::v1::{
     Frame, GoAway, HalfClose, Headers, Hello, Message, Metadata, Open, Ping, Pong, Status,
-    WindowUpdate, frame,
+    WindowUpdate, frame, metadata_entry,
 };
 use crate::stream::{StreamEvent, StreamState};
-use crate::{DEFAULT_WINDOW, PROTOCOL_VERSION};
+use crate::{DEFAULT_WINDOW, MAX_MESSAGE_SIZE, PROTOCOL_VERSION};
 
 /// How many recently closed stream ids we remember to tell a legal race
 /// (frames in flight after our terminal) apart from a protocol error.
-const RESET_IDS_CAP: usize = 1024;
+/// Beyond this many, a still-racing id may be evicted — the `stream_id
+/// <= highest_remote_open` fallback in `stream_event` catches that case
+/// (a frame on an already-seen id is a race, not a fatal UnknownStream).
+const RESET_IDS_CAP: usize = 8192;
 static NEXT_CONNECTION_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone)]
@@ -35,6 +39,22 @@ pub struct Config {
     /// RESOURCE_EXHAUSTED); local `Command::Open` beyond the limit fails
     /// with `OpenError::LimitExceeded`.
     pub max_streams: usize,
+    /// Deadline for receiving the peer's HELLO after we've sent ours (only
+    /// applies to `bind`, not `bind_pre_negotiated` — the handshake is
+    /// external there). Guards against a peer that upgrades the transport
+    /// and then goes silent (slowloris), which would otherwise pin the
+    /// driver task in `transport.next().await` forever.
+    pub handshake_timeout: Duration,
+    /// Maximum total metadata bytes (sum of key+value lengths across all
+    /// entries) accepted on a single `Open` or `Headers` frame. Guards
+    /// against a peer opening up to `max_streams` streams each carrying
+    /// huge metadata. Exceeding it is a stream-level rejection (Status code
+    /// 8, RESOURCE_EXHAUSTED), not connection-fatal — mirrors real gRPC's
+    /// ~8-16 KiB header-list default.
+    pub max_metadata_bytes: usize,
+    /// Maximum number of metadata entries accepted on a single `Open` or
+    /// `Headers` frame. Same rejection semantics as `max_metadata_bytes`.
+    pub max_metadata_entries: usize,
 }
 
 impl Default for Config {
@@ -43,6 +63,9 @@ impl Default for Config {
             initial_stream_window: DEFAULT_WINDOW,
             initial_connection_window: DEFAULT_WINDOW,
             max_streams: 1024,
+            handshake_timeout: Duration::from_secs(10),
+            max_metadata_bytes: 16 * 1024,
+            max_metadata_entries: 128,
         }
     }
 }
@@ -88,10 +111,19 @@ pub(crate) enum Command {
 }
 
 /// Sending half of a stream.
+///
+/// On drop without having reached a local terminal (`finish`/`cancel`, or
+/// `half_close` on the opener side), the slot would otherwise leak forever
+/// in `Actor::streams` (consuming a `max_streams` slot) — see `Drop` impl
+/// below, mirroring `RecvHalf::cancel_on_drop`.
 pub struct SendHalf {
     stream_id: u64,
     is_opener: bool,
     cmd_tx: mpsc::UnboundedSender<Command>,
+    /// Set once a terminal command (`Finish`/`Cancel`) or, for the opener,
+    /// `HalfClose` has already been sent — makes `Drop` a no-op so we never
+    /// double-send a terminal frame.
+    terminal_sent: bool,
 }
 
 /// Receiving half of a stream: ordered events.
@@ -154,14 +186,16 @@ impl SendHalf {
     }
 
     /// "I'm done sending" (opener side).
-    pub async fn half_close(self) -> Result<(), StreamError> {
+    pub async fn half_close(mut self) -> Result<(), StreamError> {
+        self.terminal_sent = true;
         let stream_id = self.stream_id;
         self.rt(move |done| Command::HalfClose { stream_id, done })
             .await
     }
 
     /// Terminal Status (accepting side).
-    pub async fn finish(self, status: Status) -> Result<(), StreamError> {
+    pub async fn finish(mut self, status: Status) -> Result<(), StreamError> {
+        self.terminal_sent = true;
         let stream_id = self.stream_id;
         self.rt(move |done| Command::Finish {
             stream_id,
@@ -171,10 +205,41 @@ impl SendHalf {
         .await
     }
 
-    pub fn cancel(self) {
+    pub fn cancel(mut self) {
+        self.terminal_sent = true;
         let _ = self.cmd_tx.send(Command::Cancel {
             stream_id: self.stream_id,
         });
+    }
+}
+
+impl Drop for SendHalf {
+    fn drop(&mut self) {
+        if self.terminal_sent {
+            return;
+        }
+        if self.is_opener {
+            // opener dropped without half_close/cancel — abandon the RPC so
+            // the peer learns and the actor reclaims the slot.
+            let _ = self.cmd_tx.send(Command::Cancel {
+                stream_id: self.stream_id,
+            });
+        } else {
+            // acceptor dropped without finish/cancel — synthesize a
+            // terminal Status so the peer sees a definite end and our own
+            // slot is reclaimed instead of leaking. Nothing waits on the
+            // reply oneshot, so a fresh one is created and dropped.
+            let (done, _wait) = oneshot::channel();
+            let _ = self.cmd_tx.send(Command::Finish {
+                stream_id: self.stream_id,
+                status: Status {
+                    code: 2, // UNKNOWN (gRPC canonical code) — sender dropped without a status
+                    message: "SendHalf dropped without finish/cancel".into(),
+                    trailers: Some(Metadata { entries: Vec::new() }),
+                },
+                done,
+            });
+        }
     }
 }
 
@@ -377,6 +442,11 @@ where
 {
     let connection_id = NEXT_CONNECTION_ID.fetch_add(1, Ordering::Relaxed);
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+    // Unbounded, but naturally capped: on_open only ever inserts an Incoming
+    // once per accepted stream, and the number of concurrently open streams
+    // is already bounded by Config::max_streams — so an app that stalls
+    // Connection::accept() can accumulate at most max_streams queued
+    // Incoming values before new peer Opens start getting rejected.
     let (accept_tx, accept_rx) = mpsc::unbounded_channel();
     let weak = cmd_tx.downgrade();
     (
@@ -426,7 +496,28 @@ where
                     })))
                     .await?;
 
-                let first = self.transport.next().await.ok_or(TransportClosed)?;
+                // wasm-safe deadline on the pre-Hello read: a peer that
+                // upgrades the transport and then goes silent must not pin
+                // this task forever (slowloris). futures_timer::Delay is
+                // Send and works on both native and wasm32, unlike
+                // tokio::time.
+                let first = match futures::future::select(
+                    self.transport.next(),
+                    futures_timer::Delay::new(self.config.handshake_timeout),
+                )
+                .await
+                {
+                    futures::future::Either::Left((frame, _)) => frame.ok_or(TransportClosed)?,
+                    futures::future::Either::Right((_, _)) => {
+                        tracing::warn!(
+                            connection_id = self.connection_id,
+                            side = ?self.side,
+                            timeout = ?self.config.handshake_timeout,
+                            "handshake timed out waiting for peer HELLO",
+                        );
+                        return Err(ConnError::HandshakeTimeout);
+                    }
+                };
                 let h = match first.kind {
                     Some(frame::Kind::Hello(h)) => h,
                     _ => return Err(ProtocolError::ExpectedHello.into()),
@@ -482,9 +573,16 @@ where
                         return Ok(());
                     }
                     Some(cmd) => {
-                        for out in actor.on_command(cmd) {
-                            self.transport.send(out).await?;
+                        // feed all frames, then one flush — a batch of output
+                        // (e.g. WindowUpdate + data) costs a single flush
+                        // rather than N, shrinking the window during which the
+                        // driver is blocked writing and not reading inbound
+                        // Ack/WindowUpdate/Pong.
+                        let out = actor.on_command(cmd);
+                        for f in out {
+                            self.transport.feed(f).await?;
                         }
+                        self.transport.flush().await?;
                     }
                 },
                 frame = self.transport.next() => match frame {
@@ -500,8 +598,9 @@ where
                         match actor.on_frame(frame) {
                             Ok(out) => {
                                 for f in out {
-                                    self.transport.send(f).await?;
+                                    self.transport.feed(f).await?;
                                 }
+                                self.transport.flush().await?;
                             }
                             Err(e) => {
                                 // protocol violation: best-effort GoAway, then bail
@@ -551,6 +650,16 @@ struct StreamSlot {
     events: mpsc::UnboundedSender<StreamEvent>,
     /// send commands waiting for window: (payload, done)
     blocked: VecDeque<(Bytes, oneshot::Sender<Result<(), StreamError>>)>,
+    /// Bytes consumed from this stream's recv window (on `on_message`) that
+    /// have not yet been credited back to `conn_recv_credit` (via
+    /// `Command::Credit`, fired only when the app actually reads the
+    /// `StreamEvent::Message`). If the stream is torn down while this is
+    /// still nonzero — the app cancelled/dropped early, or the peer
+    /// terminated the stream with messages still queued unread in
+    /// `events` — that remainder must be refunded to `conn_recv_credit` on
+    /// teardown (see `remove_slot`), or the peer's connection send window
+    /// permanently shrinks by the unread amount.
+    pending_credit: u32,
 }
 
 /// Pure connection logic: commands/frames in, frames out.
@@ -566,10 +675,18 @@ struct Actor {
     going_away_remote: bool,
     /// Highest id of a stream opened by the peer (for GoAway.last_stream_id).
     highest_remote_open: u64,
+    /// Highest id of a stream WE opened. Together with `highest_remote_open`
+    /// this bounds "an id that was legitimately active at some point" — a
+    /// late frame on such an id (evicted from the bounded reset set) is a
+    /// race to drop, not a fatal UnknownStream.
+    highest_local_open: u64,
     /// BTreeMap — deterministic iteration order when distributing window.
     streams: BTreeMap<u64, StreamSlot>,
     /// Maximum concurrently open streams (both directions) — DoS guard.
     max_streams: usize,
+    /// Metadata caps (Open/Headers) — DoS guard, see `Config`.
+    max_metadata_bytes: usize,
+    max_metadata_entries: usize,
     /// Streams recently closed by us: frames in flight are a legal race.
     reset_ids: HashSet<u64>,
     reset_order: VecDeque<u64>,
@@ -604,8 +721,11 @@ impl Actor {
             going_away_local: false,
             going_away_remote: false,
             highest_remote_open: 0,
+            highest_local_open: 0,
             streams: BTreeMap::new(),
             max_streams: config.max_streams,
+            max_metadata_bytes: config.max_metadata_bytes,
+            max_metadata_entries: config.max_metadata_entries,
             reset_ids: HashSet::new(),
             reset_order: VecDeque::new(),
             conn_send_window: Window::new(peer_hello.initial_connection_window),
@@ -632,10 +752,27 @@ impl Actor {
         }
     }
 
-    fn remove_slot(&mut self, stream_id: u64) {
-        self.streams.remove(&stream_id);
+    /// Tear down a stream slot. Any bytes consumed from its recv window but
+    /// never credited back to `conn_recv_credit` (see `StreamSlot::pending_credit`
+    /// — messages delivered into `events` but never read by the app before
+    /// teardown) are refunded here, same as `refund_conn_credit` does for a
+    /// message discarded outright. Without this, an early-cancelled or
+    /// remotely-terminated stream with unread buffered messages would leak
+    /// that credit forever and the peer's connection send window would
+    /// permanently shrink by the unread amount.
+    fn remove_slot(&mut self, stream_id: u64) -> Vec<Frame> {
+        let pending = self
+            .streams
+            .remove(&stream_id)
+            .map(|slot| slot.pending_credit)
+            .unwrap_or(0);
         self.mark_reset(stream_id);
         self.close_accept_if_drained();
+        if pending > 0 {
+            self.refund_conn_credit(pending)
+        } else {
+            Vec::new()
+        }
     }
 
     fn close_accept_if_drained(&mut self) {
@@ -691,6 +828,18 @@ impl Actor {
                     return vec![];
                 };
                 let stream_id = self.ids.next_id();
+                self.highest_local_open = self.highest_local_open.max(stream_id);
+                // Unbounded by design, not oversight: the per-stream flow
+                // control window (stream.rs::on_message, enforced against
+                // the peer as a FlowControlViolation) already caps how many
+                // in-flight Message bytes can ever be queued here — a
+                // stalled consumer stops the *sender* via the window, not
+                // via this channel. Switching to a bounded channel would
+                // need `try_send` + a drop/backpressure path inside the
+                // synchronous `Actor::on_command`/`on_frame` (which return
+                // `Vec<Frame>` and must not block), a bigger structural
+                // change than this fix warrants. See connection.rs on_open
+                // for the mirror-image acceptor-side channel.
                 let (events_tx, events_rx) = mpsc::unbounded_channel();
                 tracing::debug!(
                     connection_id = self.connection_id,
@@ -709,6 +858,7 @@ impl Actor {
                         ),
                         events: events_tx,
                         blocked: VecDeque::new(),
+                        pending_credit: 0,
                     },
                 );
                 let _ = reply.send(Ok((
@@ -716,6 +866,7 @@ impl Actor {
                         stream_id,
                         is_opener: true,
                         cmd_tx: cmd_tx.clone(),
+                        terminal_sent: false,
                     },
                     RecvHalf {
                         stream_id,
@@ -738,6 +889,17 @@ impl Actor {
                 payload,
                 done,
             } => {
+                if payload.len() > MAX_MESSAGE_SIZE {
+                    // the peer would treat an oversized frame as a
+                    // connection-fatal protocol error (MessageTooLarge) —
+                    // reject it locally instead of killing every stream.
+                    let _ = done.send(Err(StreamError::Connection(format!(
+                        "message size {} exceeds MAX_MESSAGE_SIZE {}",
+                        payload.len(),
+                        MAX_MESSAGE_SIZE
+                    ))));
+                    return vec![];
+                }
                 let Some(slot) = self.streams.get_mut(&stream_id) else {
                     let _ = done.send(Err(StreamError::Cancelled));
                     return vec![];
@@ -802,13 +964,14 @@ impl Actor {
                 slot.state.local_half_close();
                 let closed = slot.state.is_closed();
                 let _ = done.send(Ok(()));
-                if closed {
-                    self.remove_slot(stream_id);
-                }
-                vec![stream_frame(
+                let mut out = vec![stream_frame(
                     stream_id,
                     frame::Kind::HalfClose(HalfClose {}),
-                )]
+                )];
+                if closed {
+                    out.extend(self.remove_slot(stream_id));
+                }
+                out
             }
             Command::Finish {
                 stream_id,
@@ -821,8 +984,9 @@ impl Actor {
                 };
                 slot.state.local_terminate();
                 let _ = done.send(Ok(()));
-                self.remove_slot(stream_id);
-                vec![stream_frame(stream_id, frame::Kind::Status(status))]
+                let mut out = vec![stream_frame(stream_id, frame::Kind::Status(status))];
+                out.extend(self.remove_slot(stream_id));
+                out
             }
             Command::Cancel { stream_id } => {
                 let Some(slot) = self.streams.get_mut(&stream_id) else {
@@ -833,21 +997,25 @@ impl Actor {
                 }
                 slot.state.local_terminate();
                 let _ = slot.events.send(StreamEvent::Cancelled);
-                self.remove_slot(stream_id);
-                vec![stream_frame(
+                let mut out = vec![stream_frame(
                     stream_id,
                     frame::Kind::Cancel(crate::proto::v1::Cancel {}),
-                )]
+                )];
+                out.extend(self.remove_slot(stream_id));
+                out
             }
             Command::Credit { stream_id, bytes } => {
                 let mut out = Vec::new();
-                if let Some(slot) = self.streams.get_mut(&stream_id)
-                    && slot.state.credit_recv(bytes).is_ok()
-                {
-                    out.push(stream_frame(
-                        stream_id,
-                        frame::Kind::WindowUpdate(WindowUpdate { increment: bytes }),
-                    ));
+                if let Some(slot) = self.streams.get_mut(&stream_id) {
+                    // the app read this many bytes' worth of Message — no
+                    // longer "pending" a teardown refund.
+                    slot.pending_credit = slot.pending_credit.saturating_sub(bytes);
+                    if slot.state.credit_recv(bytes).is_ok() {
+                        out.push(stream_frame(
+                            stream_id,
+                            frame::Kind::WindowUpdate(WindowUpdate { increment: bytes }),
+                        ));
+                    }
                 }
                 self.conn_recv_credit = self.conn_recv_credit.saturating_add(bytes);
                 if self.conn_recv_credit >= self.local_conn_window / 2 {
@@ -888,9 +1056,11 @@ impl Actor {
         match kind {
             frame::Kind::Open(open) => self.on_open(stream_id, open),
             frame::Kind::Headers(h) => {
-                self.stream_event(stream_id, |slot| {
-                    slot.state.on_headers(h.metadata.unwrap_or_default())
-                })?;
+                let metadata = h.metadata.unwrap_or_default();
+                if Self::metadata_exceeds_limit(&metadata, self.max_metadata_bytes, self.max_metadata_entries) {
+                    return Ok(self.reject_stream_metadata(stream_id));
+                }
+                self.stream_event(stream_id, |slot| slot.state.on_headers(metadata))?;
                 Ok(vec![])
             }
             frame::Kind::Message(msg) => {
@@ -901,27 +1071,33 @@ impl Actor {
                     // message discarded (terminal/race) — refund the connection credit
                     return Ok(self.refund_conn_credit(len));
                 }
+                // delivered into the stream's `events` channel — counts
+                // against conn_recv_credit until the app reads it
+                // (Command::Credit) or the stream tears down (remove_slot).
+                if let Some(slot) = self.streams.get_mut(&stream_id) {
+                    slot.pending_credit = slot.pending_credit.saturating_add(len);
+                }
                 Ok(vec![])
             }
             frame::Kind::HalfClose(_) => {
                 let out = self.stream_event(stream_id, |slot| slot.state.on_half_close())?;
                 let _ = out;
+                let mut frames = Vec::new();
                 if self
                     .streams
                     .get(&stream_id)
                     .is_some_and(|s| s.state.is_closed())
                 {
-                    self.remove_slot(stream_id);
+                    frames = self.remove_slot(stream_id);
                 }
-                Ok(vec![])
+                Ok(frames)
             }
             frame::Kind::Status(status) => {
                 if let Some(slot) = self.streams.get_mut(&stream_id) {
                     let ev = slot.state.on_status(status);
                     let _ = slot.events.send(ev);
                     Self::fail_blocked(slot);
-                    self.remove_slot(stream_id);
-                    Ok(vec![])
+                    Ok(self.remove_slot(stream_id))
                 } else {
                     self.unknown(stream_id)
                 }
@@ -931,8 +1107,7 @@ impl Actor {
                     let ev = slot.state.on_cancel();
                     let _ = slot.events.send(ev);
                     Self::fail_blocked(slot);
-                    self.remove_slot(stream_id);
-                    Ok(vec![])
+                    Ok(self.remove_slot(stream_id))
                 } else {
                     self.unknown(stream_id)
                 }
@@ -1050,10 +1225,36 @@ impl Actor {
                 }),
             )]);
         }
+        if open
+            .metadata
+            .as_ref()
+            .is_some_and(|m| Self::metadata_exceeds_limit(m, self.max_metadata_bytes, self.max_metadata_entries))
+        {
+            tracing::warn!(
+                connection_id = self.connection_id,
+                side = ?self.side,
+                stream_id,
+                max_metadata_bytes = self.max_metadata_bytes,
+                max_metadata_entries = self.max_metadata_entries,
+                "rejecting peer open: metadata exceeds limit",
+            );
+            self.mark_reset(stream_id);
+            return Ok(vec![stream_frame(
+                stream_id,
+                frame::Kind::Status(Status {
+                    code: 8, // RESOURCE_EXHAUSTED
+                    message: "metadata exceeds limit".into(),
+                    trailers: Some(Metadata { entries: Vec::new() }),
+                }),
+            )]);
+        }
         self.highest_remote_open = self.highest_remote_open.max(stream_id);
         let Some(cmd_tx) = self.cmd_tx.upgrade() else {
             return Ok(vec![]); // all handles dropped — connection is dying
         };
+        // Unbounded by design here too — see the matching comment in
+        // Command::Open above; flow control (stream.rs::on_message) is the
+        // real bound on in-flight bytes queued through this channel.
         let (events_tx, events_rx) = mpsc::unbounded_channel();
         tracing::debug!(
             connection_id = self.connection_id,
@@ -1068,6 +1269,7 @@ impl Actor {
                 state: StreamState::new(false, self.peer_stream_window, self.local_stream_window),
                 events: events_tx,
                 blocked: VecDeque::new(),
+                pending_credit: 0,
             },
         );
         if let Some(accept_tx) = &self.accept_tx {
@@ -1078,6 +1280,7 @@ impl Actor {
                     stream_id,
                     is_opener: false,
                     cmd_tx: cmd_tx.clone(),
+                    terminal_sent: false,
                 },
                 recv: RecvHalf {
                     stream_id,
@@ -1098,8 +1301,19 @@ impl Actor {
         apply: impl FnOnce(&mut StreamSlot) -> Result<StreamEvent, ProtocolError>,
     ) -> Result<bool, ProtocolError> {
         let Some(slot) = self.streams.get_mut(&stream_id) else {
-            return if self.reset_ids.contains(&stream_id) {
-                Ok(false) // legal race: frame in flight after our terminal
+            // A frame for a stream we have no slot for is a legal race — a
+            // frame in flight from the peer before it saw our terminal — when
+            // the id is in our recent-reset set OR is one the peer already
+            // opened at some point (`<= highest_remote_open`): the reset set is
+            // bounded, so a very high stream-churn burst can evict a
+            // still-racing id, but such an id is always `<= highest_remote_open`
+            // and must not tear the whole connection down. A frame for an id
+            // ABOVE the highest ever opened is genuinely unknown → protocol
+            // error.
+            return if self.reset_ids.contains(&stream_id)
+                || stream_id <= self.highest_remote_open.max(self.highest_local_open)
+            {
+                Ok(false)
             } else {
                 Err(ProtocolError::UnknownStream(stream_id))
             };
@@ -1135,6 +1349,57 @@ impl Actor {
         }
     }
 
+    /// Total metadata size (sum of key+value bytes) or entry count exceeds
+    /// the configured caps — DoS guard for `Open`/`Headers` (see `Config`).
+    fn metadata_exceeds_limit(metadata: &Metadata, max_bytes: usize, max_entries: usize) -> bool {
+        if metadata.entries.len() > max_entries {
+            return true;
+        }
+        let total: usize = metadata
+            .entries
+            .iter()
+            .map(|e| {
+                let value_len = match &e.value {
+                    Some(metadata_entry::Value::Ascii(s)) => s.len(),
+                    Some(metadata_entry::Value::Bin(b)) => b.len(),
+                    None => 0,
+                };
+                e.key.len() + value_len
+            })
+            .sum();
+        total > max_bytes
+    }
+
+    /// Reject an existing stream's `Headers` for carrying oversized
+    /// metadata: a stream-level Status(RESOURCE_EXHAUSTED=8), not
+    /// connection-fatal, mirroring how `on_open` rejects an oversized
+    /// `Open`. If the stream is unknown (already reset — a legal race),
+    /// this is a silent no-op.
+    fn reject_stream_metadata(&mut self, stream_id: u64) -> Vec<Frame> {
+        let Some(slot) = self.streams.get_mut(&stream_id) else {
+            return Vec::new();
+        };
+        tracing::warn!(
+            connection_id = self.connection_id,
+            side = ?self.side,
+            stream_id,
+            max_metadata_bytes = self.max_metadata_bytes,
+            max_metadata_entries = self.max_metadata_entries,
+            "rejecting HEADERS: metadata exceeds limit",
+        );
+        let status = Status {
+            code: 8, // RESOURCE_EXHAUSTED
+            message: "metadata exceeds limit".into(),
+            trailers: Some(Metadata { entries: Vec::new() }),
+        };
+        let ev = slot.state.on_status(status.clone());
+        let _ = slot.events.send(ev);
+        Self::fail_blocked(slot);
+        let mut out = self.remove_slot(stream_id);
+        out.push(stream_frame(stream_id, frame::Kind::Status(status)));
+        out
+    }
+
     /// Hand out window to blocked sends. `only` — a specific stream
     /// (its window was replenished) or all (the connection window was).
     fn drain_blocked(&mut self, only: Option<u64>) -> Vec<Frame> {
@@ -1148,6 +1413,18 @@ impl Actor {
                 continue;
             };
             while let Some((payload, _)) = slot.blocked.front() {
+                // defensive: Command::Send already rejects oversized
+                // payloads before they ever reach `blocked`, but guard here
+                // too so this invariant can never regress silently.
+                if payload.len() > MAX_MESSAGE_SIZE {
+                    let (payload, done) = slot.blocked.pop_front().unwrap();
+                    let _ = done.send(Err(StreamError::Connection(format!(
+                        "message size {} exceeds MAX_MESSAGE_SIZE {}",
+                        payload.len(),
+                        MAX_MESSAGE_SIZE
+                    ))));
+                    continue;
+                }
                 if slot.state.can_send() && self.conn_send_window.can_send() {
                     let len = payload.len();
                     let (payload, done) = slot.blocked.pop_front().unwrap();
@@ -1170,7 +1447,12 @@ impl Actor {
     }
 
     fn unknown(&self, stream_id: u64) -> Result<Vec<Frame>, ProtocolError> {
-        if self.reset_ids.contains(&stream_id) {
+        // Same race tolerance as `stream_event`: a recently-reset id, or any
+        // id at/below the highest the peer ever opened, is a legal in-flight
+        // race (bounded reset set may have evicted it) — not a fatal error.
+        if self.reset_ids.contains(&stream_id)
+            || stream_id <= self.highest_remote_open.max(self.highest_local_open)
+        {
             Ok(vec![])
         } else {
             Err(ProtocolError::UnknownStream(stream_id))

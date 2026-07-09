@@ -21,6 +21,7 @@ pub type BoxFrameTransport = Pin<Box<dyn FrameDuplex>>;
 
 /// Observable state of a reconnectable transport/channel.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub enum ConnState {
     /// No connection yet and none in progress (lazy channel before first call).
     #[default]

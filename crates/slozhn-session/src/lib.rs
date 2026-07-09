@@ -51,6 +51,7 @@ impl Default for SessionConfig {
 }
 
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum SessionError {
     #[error("replay buffer overflow — session killed (spec §8: no silent drop)")]
     BufferOverflow,

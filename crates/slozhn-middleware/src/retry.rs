@@ -140,12 +140,16 @@ impl RetryPolicy {
 }
 
 /// See module docs. `Default`: 3 attempts, 256 KiB buffer, 50 ms base backoff,
-/// and no retryable methods.
+/// 30 s backoff ceiling, and no retryable methods.
 #[derive(Clone, Debug)]
 pub struct RetryLayer {
     pub max_attempts: u32,
     pub buffer_limit: usize,
     pub base_backoff: Duration,
+    /// Ceiling on the (pre-jitter) exponential backoff, regardless of
+    /// `max_attempts` — also what the computation clamps to if
+    /// `2u32.pow(attempt - 1)` would overflow for a very large attempt count.
+    pub max_backoff: Duration,
     pub policy: RetryPolicy,
 }
 
@@ -155,6 +159,7 @@ impl Default for RetryLayer {
             max_attempts: 3,
             buffer_limit: 256 * 1024,
             base_backoff: Duration::from_millis(50),
+            max_backoff: Duration::from_secs(30),
             policy: RetryPolicy::default(),
         }
     }
@@ -173,6 +178,11 @@ impl RetryLayer {
 
     pub fn with_base_backoff(mut self, base_backoff: Duration) -> Self {
         self.base_backoff = base_backoff;
+        self
+    }
+
+    pub fn with_max_backoff(mut self, max_backoff: Duration) -> Self {
+        self.max_backoff = max_backoff;
         self
     }
 
@@ -273,6 +283,16 @@ fn is_unavailable<RB>(resp: &http::Response<RB>) -> bool {
 fn jittered(base: Duration) -> Duration {
     let half = base / 2;
     half + Duration::from_millis(fastrand::u64(0..=half.as_millis() as u64))
+}
+
+/// Exponential backoff for `attempt` (1-based), clamped to `max_backoff`.
+/// `2u32.pow(attempt - 1)` would panic (debug) or wrap (release) once
+/// `attempt` is large enough — `checked_pow` plus a saturating fallback
+/// avoids both, and the ceiling keeps the delay sane even before overflow
+/// would occur.
+fn backoff_for(base_backoff: Duration, max_backoff: Duration, attempt: u32) -> Duration {
+    let multiplier = 2u32.checked_pow(attempt.saturating_sub(1)).unwrap_or(u32::MAX);
+    base_backoff.saturating_mul(multiplier).min(max_backoff)
 }
 
 fn normalize_method(method: impl Into<String>) -> String {
@@ -410,8 +430,8 @@ where
                     }
                     other => return other,
                 }
-                futures_timer::Delay::new(jittered(config.base_backoff * 2u32.pow(attempt - 1)))
-                    .await;
+                let backoff = backoff_for(config.base_backoff, config.max_backoff, attempt);
+                futures_timer::Delay::new(jittered(backoff)).await;
             }
         })
     }
@@ -705,5 +725,54 @@ mod tests {
         // первый ответ (UNAVAILABLE) отдан как есть, ретрая не было
         assert!(resp.headers().contains_key("grpc-status"));
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn backoff_never_panics_or_overflows_for_large_attempt() {
+        let base = Duration::from_millis(50);
+        let max = Duration::from_secs(30);
+        for attempt in [1, 2, 30, 31, 32, 63, 64, 1_000, u32::MAX] {
+            let backoff = backoff_for(base, max, attempt);
+            assert!(backoff <= max, "attempt {attempt} produced {backoff:?} > {max:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn large_max_attempts_does_not_panic_computing_backoff() {
+        // Regression test for A3: `2u32.pow(attempt - 1)` used to panic in
+        // debug builds long before `max_attempts` attempts were exhausted.
+        // Cap it low via `max_backoff` so the test itself stays fast.
+        let calls = Arc::new(AtomicU32::new(0));
+        let always_unavailable = tower::service_fn({
+            let calls = calls.clone();
+            move |_req: http::Request<TonicBody>| {
+                let calls = calls.clone();
+                async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    let mut resp = http::Response::new(String::new());
+                    resp.headers_mut()
+                        .insert("grpc-status", "14".parse().unwrap());
+                    Ok::<_, std::convert::Infallible>(resp)
+                }
+            }
+        });
+        let mut svc = RetryLayer {
+            max_attempts: 40, // 2^39 would overflow u32 well before this
+            base_backoff: Duration::from_micros(1),
+            max_backoff: Duration::from_micros(1),
+            ..Default::default()
+        }
+        .retry_method("/t.S/M")
+        .layer(always_unavailable);
+
+        let resp = svc
+            .ready()
+            .await
+            .unwrap()
+            .call(unary_req(b"hi"))
+            .await
+            .unwrap();
+        assert!(resp.headers().contains_key("grpc-status"));
+        assert_eq!(calls.load(Ordering::SeqCst), 40);
     }
 }

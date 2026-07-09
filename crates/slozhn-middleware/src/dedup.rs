@@ -38,6 +38,21 @@
 //! per-process only: concurrent duplicates that land on DIFFERENT nodes
 //! behind a load balancer may still both execute — cross-node single-flight
 //! would require store-side locking and is out of scope here.
+//!
+//! **The dedup key is caller-controlled, by design and by the gRPC
+//! idempotency-key convention**: `x-idempotency-key` is whatever value the
+//! peer put on the request, same as `Idempotency-Key` in the Stripe-style
+//! HTTP convention this mirrors. That's fine for its actual job — collapsing
+//! a client's own retries — but it means DO NOT use the raw dedup cache
+//! entry as a security decision (e.g. "this key was already spent by this
+//! user, so trust the cached result for anyone"): nothing stops a different,
+//! unrelated caller from supplying the same key and observing (or, if it
+//! raced the original, receiving) another caller's cached response. If keys
+//! must not be guessable/reusable across callers, scope them to a verified
+//! identity with [`DedupLayer::key_prefix_by_identity`], which prefixes the
+//! cache key with a string derived from the post-auth `Identity<T>` placed
+//! in request extensions by `AuthLayer` — order `DedupLayer` AFTER
+//! `AuthLayer` in the stack for the prefix to see it.
 
 use std::collections::{HashMap, VecDeque};
 use std::future::Future;
@@ -199,16 +214,26 @@ impl DedupStore for InMemoryDedupStore {
     }
 }
 
+/// Derives a cache-key prefix from request extensions (a post-auth
+/// `Identity<T>`, typically). `None` means the request carries no identity
+/// this resolver recognizes.
+type IdentityPrefixFn = Arc<dyn Fn(&http::Extensions) -> Option<String> + Send + Sync>;
+
 /// Server layer: dedups replays of the same `x-idempotency-key`.
 ///
 /// Defaults: 300s TTL, 10_000 max entries (in-memory store), 256 KiB max
 /// cached body. Use [`DedupLayer::store`] to share entries across instances.
+///
+/// See the module docs: `x-idempotency-key` is caller-supplied and MUST NOT
+/// be treated as a security boundary on its own — use
+/// [`DedupLayer::key_prefix_by_identity`] to scope it to a verified caller.
 #[derive(Clone)]
 pub struct DedupLayer {
     pub ttl: Duration,
     pub max_body_bytes: usize,
     store: Arc<dyn DedupStore>,
     in_flight: InFlightMap,
+    identity_prefix: Option<IdentityPrefixFn>,
 }
 
 impl Default for DedupLayer {
@@ -218,6 +243,7 @@ impl Default for DedupLayer {
             max_body_bytes: 256 * 1024,
             store: Arc::new(InMemoryDedupStore::new(10_000)),
             in_flight: Arc::new(Mutex::new(HashMap::new())),
+            identity_prefix: None,
         }
     }
 }
@@ -238,6 +264,25 @@ impl DedupLayer {
         self.max_body_bytes = max_body_bytes;
         self
     }
+
+    /// Scope the dedup cache key to a verified caller: the `x-idempotency-key`
+    /// value is prefixed with a string derived from the post-auth
+    /// `Identity<T>` that `AuthLayer` places in request extensions (order
+    /// `DedupLayer` AFTER `AuthLayer` for this to see it). Without a prefix,
+    /// two different callers who happen to submit the same idempotency key
+    /// would collide in the cache; with it, they land in disjoint entries.
+    /// Requests with no matching `Identity<T>` extension fall back to the
+    /// raw, unprefixed key.
+    pub fn key_prefix_by_identity<T, F>(mut self, f: F) -> Self
+    where
+        T: Clone + Send + Sync + 'static,
+        F: Fn(&T) -> String + Send + Sync + 'static,
+    {
+        self.identity_prefix = Some(Arc::new(move |extensions: &http::Extensions| {
+            extensions.get::<crate::auth::Identity<T>>().map(|identity| f(&identity.0))
+        }));
+        self
+    }
 }
 
 impl<S> tower::Layer<S> for DedupLayer {
@@ -250,6 +295,7 @@ impl<S> tower::Layer<S> for DedupLayer {
             ttl: self.ttl,
             max_body_bytes: self.max_body_bytes,
             in_flight: self.in_flight.clone(),
+            identity_prefix: self.identity_prefix.clone(),
         }
     }
 }
@@ -261,6 +307,7 @@ pub struct DedupService<S> {
     ttl: Duration,
     max_body_bytes: usize,
     in_flight: InFlightMap,
+    identity_prefix: Option<IdentityPrefixFn>,
 }
 
 fn headers_to_pairs(headers: &HeaderMap) -> Vec<(String, Bytes)> {
@@ -440,14 +487,22 @@ where
     }
 
     fn call(&mut self, req: http::Request<TonicBody>) -> Self::Future {
-        let key = req
+        let raw_key = req
             .headers()
             .get(IDEMPOTENCY_KEY_METADATA)
             .and_then(|v| v.to_str().ok())
             .map(str::to_owned);
 
-        let Some(key) = key else {
+        let Some(raw_key) = raw_key else {
             return Box::pin(self.inner.call(req));
+        };
+
+        // Scope the key to the verified caller when a resolver is
+        // configured, so unrelated callers reusing the same idempotency
+        // key can't collide (or peek at each other's cached response).
+        let key = match self.identity_prefix.as_ref().and_then(|f| f(req.extensions())) {
+            Some(prefix) => format!("{prefix}\u{1f}{raw_key}"),
+            None => raw_key,
         };
 
         let store = self.store.clone();
@@ -779,6 +834,46 @@ mod tests {
             2,
             "leader's oversized result forces the waiter to execute after recheck-miss"
         );
+    }
+
+    #[tokio::test]
+    async fn identity_prefix_separates_colliding_keys_across_callers() {
+        let calls = Arc::new(AtomicU32::new(0));
+        let mut svc = DedupLayer::default()
+            .key_prefix_by_identity::<String, _>(|id: &String| id.clone())
+            .layer(counting_echo(calls.clone(), b"hello"));
+
+        let mut alice_req = req_with_key(Some("k1"));
+        alice_req.extensions_mut().insert(crate::auth::Identity("alice".to_owned()));
+        let mut bob_req = req_with_key(Some("k1"));
+        bob_req.extensions_mut().insert(crate::auth::Identity("bob".to_owned()));
+
+        svc.ready().await.unwrap().call(alice_req).await.unwrap();
+        svc.ready().await.unwrap().call(bob_req).await.unwrap();
+
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "same raw idempotency key from two identities must not collide"
+        );
+    }
+
+    #[tokio::test]
+    async fn identity_prefix_still_dedups_the_same_caller() {
+        let calls = Arc::new(AtomicU32::new(0));
+        let mut svc = DedupLayer::default()
+            .key_prefix_by_identity::<String, _>(|id: &String| id.clone())
+            .layer(counting_echo(calls.clone(), b"hello"));
+
+        let mut req1 = req_with_key(Some("k1"));
+        req1.extensions_mut().insert(crate::auth::Identity("alice".to_owned()));
+        let mut req2 = req_with_key(Some("k1"));
+        req2.extensions_mut().insert(crate::auth::Identity("alice".to_owned()));
+
+        svc.ready().await.unwrap().call(req1).await.unwrap();
+        svc.ready().await.unwrap().call(req2).await.unwrap();
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "same caller replay is still deduped");
     }
 
     #[tokio::test]
