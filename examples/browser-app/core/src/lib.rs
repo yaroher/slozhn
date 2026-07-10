@@ -58,6 +58,9 @@ impl Core {
                     ConnState::Backoff { delay, attempt } => {
                         format!("backoff {:.1}s (attempt {attempt})", delay.as_secs_f32())
                     }
+                    // ConnState is #[non_exhaustive]: a future state renders
+                    // generically rather than breaking this build
+                    other => format!("{other:?}"),
                 };
                 let _ = cb.call1(&JsValue::NULL, &JsValue::from_str(&text));
                 if rx.changed().await.is_err() {

@@ -38,7 +38,7 @@ jobs:
       # docs reuse the dependency artifacts already in target/
       - run: cargo doc --workspace --no-deps
       # bench-rot guard: benches must at least keep compiling
-      - run: cargo build -p slozhn-frame --benches --no-run
+      - run: cargo build -p slozhn-frame --benches
 
   wasm:
     runs-on: ubuntu-latest
