@@ -9,6 +9,7 @@ rust-version.workspace = true
 slozhn-proto = { path = "../slozhn-proto" }
 
 [dev-dependencies]
+slozhn = { path = "../slozhn", features = ["testing"] }
 slozhn-frame = { path = "../slozhn-frame" }
 slozhn-client = { path = "../slozhn-client" }
 slozhn-server = { path = "../slozhn-server" }

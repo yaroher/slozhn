@@ -67,7 +67,7 @@ rpc PutSettings(PutSettingsRequest) returns (PutSettingsResponse) {
 ### 2. Server (axum)
 
 ```toml
-slozhn = { version = "0.1", features = ["client", "server"] }
+slozhn = { version = "1", features = ["client", "server"] }
 ```
 
 ```rust
@@ -104,8 +104,9 @@ for the reconnect with exponential backoff.
 
 Browser notes: build with `wasm32-unknown-unknown`; the client crate pulls
 no tokio runtime. The browser `WebSocket` API cannot set headers — pass
-auth via query parameters or cookies (`.header(...)` is native-only and
-panics at build time on wasm).
+auth via cookies or per-RPC metadata (`AuthTokenLayer`). `.header(...)` is
+native-only: it does not exist on wasm, so misuse is a compile error rather
+than a runtime surprise.
 
 > **Warning — query-string tokens leak.** A token on the connection URL
 > (`?token=...`) ends up in reverse-proxy/CDN access logs, browser history,
@@ -131,19 +132,37 @@ tonic client ──► Channel ──► [session] ──► codec ──► Web
 - **Session layer** (spec §8): seq/ack, a bounded replay buffer, and dedup —
   streams survive physical disconnects; a rejected resume honestly fails
   RPCs with `UNAVAILABLE`, and the reconnect wrapper builds a fresh session.
+- **Wire specification**: [`docs/protocol.md`](docs/protocol.md) — normative,
+  language-neutral, backed by a conformance suite.
 - Full design document: `docs/superpowers/specs/2026-07-08-slozhn-design.md`.
 
 ## Crates
 
 | Crate | What it is |
 |---|---|
-| `slozhn` | Facade: `client::builder`, `server::{grpc_ws, grpc_ws_session}` |
+| `slozhn` | Facade: `client::builder`, `server::{grpc_ws, grpc_ws_session}`, `testing` |
 | `slozhn-frame` | Envelope + stream-multiplexing state machine (portable core) |
 | `slozhn-ws` | WebSocket byte duplex: tungstenite (native) / web-sys (wasm) |
 | `slozhn-client` | tower channel for tonic stubs + reconnect |
-| `slozhn-server` | WS → tonic `Routes` bridge (axum) |
+| `slozhn-server` | WS → tonic `Routes` bridge (axum) + `grpc_proxy` |
 | `slozhn-session` | Resume layer: seq/ack/replay |
+| `slozhn-middleware` | tower layers: trace, metrics, retry, auth, rate limit, dedup, validate, deadline, origin, recovery |
 | `slozhn-proto` | Generated types (easyp, committed) |
+
+## Compatibility
+
+- **MSRV**: Rust 1.88 (edition 2024 + let-chains).
+- **Features** (all additive): `client` (default), `server`, `middleware`,
+  `otel` (W3C traceparent + `metrics`→OTel bridge), `validate` (PGV message
+  validation), `testing` (in-process harness, dev-only).
+- **Semver**: public error enums, `ConnState` and `GoAwayCode` are
+  `#[non_exhaustive]` — match them with a `_` arm. slozhn re-exports tonic's
+  surface (`Status`, `Code`, `body::Body`), so a tonic major bump implies one
+  here.
+- **Wire protocol**: version 1, specified in
+  [`docs/protocol.md`](docs/protocol.md) and pinned by the conformance suite
+  (`crates/slozhn-frame/tests/conformance.rs`) — an implementer in another
+  language can build against it without reading the Rust.
 
 ## Examples
 
@@ -199,6 +218,47 @@ Raw channels also send Ping/Pong keepalives by default (`30s` interval,
 do not use logical keepalive pings during reconnect gaps; the session transport
 publishes reconnect state and resumes the logical connection itself.
 
+## Testing in one process (feature `testing`)
+
+The slozhn analogue of gRPC's `bufconn`: a real tonic client talking to real
+`tonic::Routes` over an in-memory transport — one runtime, no sockets, no
+ports, no axum. Milliseconds instead of hundreds of them, and no flaky
+port binding.
+
+```toml
+[dev-dependencies]
+slozhn = { version = "1", features = ["testing"] }
+```
+
+```rust
+let routes = tonic::service::Routes::new(EchoServer::new(MyEcho));
+let mut client = EchoClient::new(slozhn::testing::channel(routes));
+let resp = client.unary(Request::new(msg)).await?;   // ordinary tonic
+```
+
+Three fidelity levels — pick the cheapest that still exercises what you test:
+
+| Function | What runs for real | Use for |
+|---|---|---|
+| `channel(routes)` | envelope state machine, flow control, streams, metadata, trailers, middleware | service logic, middleware |
+| `channel_over_bytes(routes)` | + the byte codec (the literal `[]byte` transport) | encoding, framing, size limits |
+| `session_channel(routes)` | + session layer: seq/ack, replay, resume | reconnect and stream-resume behavior |
+
+`session_channel` returns a `Breaker` that severs the physical transport on
+demand — the client reconnects through the in-memory factory and resumes,
+so a mid-stream network break is testable without touching the network.
+`Breaker::connect_count()` proves a break actually happened and recovered
+(instead of a test passing because nothing was ever severed):
+
+```rust
+let (channel, breaker) = slozhn::testing::session_channel(routes).await;
+let mut stream = client.server_stream(req).await?.into_inner();
+stream.next().await;          // first message arrives
+breaker.kill();               // network dies mid-stream
+while let Some(m) = stream.next().await { m?; }   // resumed transparently
+assert_eq!(breaker.connect_count(), 2);
+```
+
 ## Performance
 
 `cargo bench -p slozhn-frame` (criterion; figures below from an Intel
@@ -229,13 +289,24 @@ registry.drain_all(slozhn::frame::GoAwayCode::Graceful);
 
 ### Limits & observability
 
-Both resource axes are capped by default: `frame::Config.max_streams`
-(1024 concurrent streams per connection — inbound opens over the limit get
-`RESOURCE_EXHAUSTED`, local opens fail with `OpenError::LimitExceeded`) and
-`ServerSessionConfig.max_sessions` (10 000 — new sessions beyond the cap are
-rejected with a `resume_rejected` Hello; resumes of existing sessions always
-pass). For metrics, poll `SessionManager::session_count()` and
-`ConnectionRegistry::len()`.
+Every resource axis is capped by default — a peer cannot force unbounded
+work or memory:
+
+| Limit | Default | Over the limit |
+|---|---|---|
+| `frame::Config.max_streams` | 1024 / connection | inbound `Open` → `RESOURCE_EXHAUSTED`; local open → `OpenError::LimitExceeded` |
+| `frame::Config.max_metadata_bytes` / `max_metadata_entries` | 16 KiB / 128 | `Open`/`Headers` rejected stream-level (`RESOURCE_EXHAUSTED`) |
+| `frame::Config.handshake_timeout` | 10 s | pre-Hello silence → connection dropped (slowloris guard) |
+| `MAX_MESSAGE_SIZE` | 4 MiB | rejected on both send and receive; the WS transport is capped to match |
+| receive flow-control window | 64 KiB | a peer ignoring its credit → `FlowControlViolation`, connection closed |
+| `ServerSessionConfig.max_sessions` | 10 000 | new sessions get a `resume_rejected` Hello; resumes of existing sessions always pass |
+| `ConnectionRegistry::with_max_connections(n)` | uncapped | new WS upgrades rejected with GoAway |
+
+For metrics, poll `SessionManager::session_count()` and
+`ConnectionRegistry::len()`, or wire the `metrics` facade (see below) —
+`slozhn_sessions_active`, `slozhn_ws_connections_active`,
+`slozhn_reconnects_total`, `slozhn_session_resume_total` are emitted from
+the transport itself.
 
 gRPC server reflection and `grpc.health.v1.Health` are ordinary tonic
 services and work over the bridge unmodified — add `tonic-reflection` /
@@ -716,9 +787,14 @@ re-runs CI, creates a GitHub release, and publishes the crates to crates.io
 
 ## Status
 
-The v1 network core is complete. Deferred: a typed proto boundary for wasm
-(WIT replacement, spec §9), Kotlin/Swift bindings, tracing/middleware,
-server→client RPC.
+The v1 network core, the middleware suite, the gateway proxy and the
+in-process test harness are complete; the wire protocol is specified and
+conformance-tested.
+
+Deferred: a typed proto boundary for wasm (WIT replacement, spec §9),
+Kotlin/Swift bindings (the client core is FFI-ready — platform-agnostic
+transport and executor injection), server→client RPC, protocol-frame rate
+limiting (belongs at the proxy/L4 layer, see Security).
 
 ## License
 

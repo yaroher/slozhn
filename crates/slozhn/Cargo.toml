@@ -19,6 +19,9 @@ middleware = ["dep:slozhn-middleware"]
 otel = ["middleware", "slozhn-middleware/otel"]
 # PGV message validation (reflection + typed) in the middleware ValidateLayer
 validate = ["middleware", "slozhn-middleware/validate"]
+# In-process client<->server test harness (bufconn equivalent). Dev-only:
+# pulls the server side into the client's dependency graph.
+testing = ["client", "server", "dep:tower", "dep:tonic"]
 
 [dependencies]
 slozhn-frame = { path = "../slozhn-frame", version = "1.1.0" }
@@ -29,6 +32,8 @@ slozhn-server = { path = "../slozhn-server", version = "1.1.0", optional = true 
 slozhn-middleware = { path = "../slozhn-middleware", version = "1.1.0", optional = true }
 futures.workspace = true
 http = "1"
+tower = { version = "0.5", default-features = false, optional = true }
+tonic = { version = "0.14", default-features = false, features = ["codegen"], optional = true }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 tokio = { workspace = true, features = ["rt"] }

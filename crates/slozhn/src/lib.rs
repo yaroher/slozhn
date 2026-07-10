@@ -17,6 +17,8 @@
 pub mod client;
 #[cfg(all(feature = "server", not(target_arch = "wasm32")))]
 pub mod server;
+#[cfg(all(feature = "testing", not(target_arch = "wasm32")))]
+pub mod testing;
 
 #[cfg(feature = "middleware")]
 pub use slozhn_middleware as middleware;

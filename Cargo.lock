@@ -1655,6 +1655,8 @@ dependencies = [
  "slozhn-session",
  "slozhn-ws",
  "tokio",
+ "tonic",
+ "tower",
  "wasm-bindgen-futures",
 ]
 
@@ -1703,6 +1705,7 @@ dependencies = [
  "bytes",
  "futures",
  "http",
+ "slozhn",
  "slozhn-client",
  "slozhn-frame",
  "slozhn-proto",
