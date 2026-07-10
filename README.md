@@ -155,6 +155,8 @@ tonic client ──► Channel ──► [session] ──► codec ──► Web
 - **Features** (all additive): `client` (default), `server`, `middleware`,
   `otel` (W3C traceparent + `metrics`→OTel bridge), `validate` (PGV message
   validation), `testing` (in-process harness, dev-only).
+  `validate` needs **`protoc` on the build machine** — it pulls
+  `prost-validate-types`, whose `build.rs` compiles `validate.proto`.
 - **Semver**: public error enums, `ConnState` and `GoAwayCode` are
   `#[non_exhaustive]` — match them with a `_` arm. slozhn re-exports tonic's
   surface (`Status`, `Code`, `body::Body`), so a tonic major bump implies one

@@ -21,6 +21,11 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
+      # the `validate` feature pulls prost-validate-types, whose build.rs
+      # compiles validate.proto and therefore needs protoc
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: protoc
       - uses: Swatinem/rust-cache@v2
         with:
           # PRs restore the master cache but never spend time saving
@@ -42,6 +47,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: wasm32-unknown-unknown
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: protoc
       - uses: Swatinem/rust-cache@v2
         with:
           save-if: ${{ github.ref == 'refs/heads/master' }}
@@ -62,7 +70,7 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/master' }}
       - uses: taiki-e/install-action@v2
         with:
-          tool: wasm-pack
+          tool: wasm-pack,protoc
       - run: ./examples/echo-wasm/run-browser-tests.sh
 
   supply-chain:
